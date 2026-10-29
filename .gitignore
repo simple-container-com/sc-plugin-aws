@@ -1,0 +1,20 @@
+# Compiled binaries
+/sc-plugin-aws
+/cloud-helpers
+/plugin/sc-plugin-aws
+/plugin/cloud-helpers
+/dist/
+/bin/
+
+# Go test cache
+/plugin/vendor/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
