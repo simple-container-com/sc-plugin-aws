@@ -45,6 +45,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"sync"
 
 	"gopkg.in/yaml.v3"
@@ -177,8 +178,9 @@ var provisionDispatch = map[string]provisionFunc{
 func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (resp *scpluginv1.ProvisionResponse, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "sc-plugin-aws Provision panic: %v\n", r)
-			err = fmt.Errorf("sc-plugin-aws Provision panic: %v", r)
+			stack := debug.Stack()
+			fmt.Fprintf(os.Stderr, "sc-plugin-aws Provision panic: %v\n%s\n", r, stack)
+			err = fmt.Errorf("sc-plugin-aws Provision panic: %v\n%s", r, stack)
 		}
 	}()
 	fn, ok := provisionDispatch[req.GetResourceType()]
@@ -209,7 +211,25 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 			Environment: req.GetHeader().GetEnvironment(),
 		},
 	}
-	out, err := fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New(), ComputeContext: newCapturingCollector()})
+
+	// Build an aws Pulumi provider INSIDE the plugin's own pctx. A
+	// ProviderResource from SC core's pctx cannot cross the bus
+	// (hangs silently — memory sc_plugin_provider_cannot_cross_pctx),
+	// so the plugin reconstructs the provider byte-identically from
+	// the AccountConfig embedded in the resource config. Same name,
+	// same inputs → same URN → Pulumi reuses the existing state entry.
+	provider, perr := p.buildAwsProvider(pctx, cfg, req.GetHeader().GetStackName())
+	if perr != nil {
+		return nil, errors.Wrap(perr, "build aws provider inside plugin pctx")
+	}
+
+	params := pApi.ProvisionParams{
+		Log:              logger.New(),
+		ComputeContext:   newCapturingCollector(),
+		Provider:         provider,
+		BaseEnvVariables: map[string]string{},
+	}
+	out, err := fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, params)
 	if err != nil {
 		p.progress.Error("provision", err.Error())
 		return nil, err
@@ -391,6 +411,46 @@ func (p *awsPlugin) LogStream(_ *scpluginv1.LogStreamRequest, stream scpluginv1.
 	}
 }
 
+// buildAwsProvider constructs an aws Pulumi provider inside the
+// plugin's own pctx, byte-identical by URN to the one SC core
+// registered via the Provider RPC. The provider CANNOT cross RPC
+// boundaries (memory sc_plugin_provider_cannot_cross_pctx), so each
+// Provision call rebuilds it from the AccountConfig embedded in the
+// resource config. The provider name mirrors
+// `input.ToResName(req.ProviderResourceName)` SC core uses — the
+// convention is `<provider-type>--<env>` for the registered provider.
+func (p *awsPlugin) buildAwsProvider(pctx *sdk.Context, cfg any, stackName string) (sdk.ProviderResource, error) {
+	authCfg, ok := cfg.(api.AuthConfig)
+	if !ok {
+		return nil, errors.Errorf("decoded config (%T) does not implement api.AuthConfig — cannot derive AWS credentials", cfg)
+	}
+	var accountCfg awsApi.AccountConfig
+	if authCfg.CredentialsValue() != "" {
+		if err := api.ConvertAuth(authCfg, &accountCfg); err != nil {
+			return nil, errors.Wrap(err, "convert aws-token credentials to AccountConfig")
+		}
+	}
+	providerInput := api.ResourceInput{
+		Descriptor: &api.ResourceDescriptor{
+			Type:   awsApi.ProviderType,
+			Name:   awsApi.ProviderType,
+			Config: api.Config{Config: &accountCfg},
+		},
+		StackParams: &api.StackParams{
+			StackName:   stackName,
+			Environment: pctx.Stack(),
+		},
+	}
+	out, err := awsInternal.Provider(pctx, api.Stack{Name: stackName}, providerInput, pApi.ProvisionParams{Log: logger.New(), ComputeContext: newCapturingCollector()})
+	if err != nil {
+		return nil, err
+	}
+	if pr, ok := out.Ref.(sdk.ProviderResource); ok {
+		return pr, nil
+	}
+	return nil, errors.Errorf("awsInternal.Provider returned a non-ProviderResource ref (%T)", out.Ref)
+}
+
 // decodeTypedConfig picks the correct config shape per resource type.
 // Mirrors pulumi/aws/init.go's dispatch — the config decoder used by
 // `aws.RegisterProviderConfig` picks the right type on the config
@@ -443,22 +503,50 @@ func decodeTypedConfig(resourceType string, inputs map[string]*scpluginv1.InputV
 func decodeInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) error {
 	plain := make(map[string]any, len(inputs))
 	for k, v := range inputs {
-		switch x := v.GetValue().(type) {
-		case *scpluginv1.InputValue_StringValue:
-			plain[k] = x.StringValue
-		case *scpluginv1.InputValue_BoolValue:
-			plain[k] = x.BoolValue
-		case *scpluginv1.InputValue_DoubleValue:
-			plain[k] = x.DoubleValue
-		case *scpluginv1.InputValue_BytesValue:
-			plain[k] = string(x.BytesValue)
-		}
+		plain[k] = unwrapInputValue(v)
 	}
 	b, err := yaml.Marshal(plain)
 	if err != nil {
 		return err
 	}
 	return yaml.Unmarshal(b, out)
+}
+
+// unwrapInputValue recursively flattens an InputValue tree back into
+// Go types the yaml round-trip can unmarshal into a typed struct.
+// Scalar-only decoding (the earlier shape) dropped every nested map
+// and list, so a stackConfig.image.* block arrived as a bare
+// stackConfig key with no value, and the AWS Lambda driver panicked
+// dereferencing `*ContainerImage`. Live-caught against forge-notifier
+// staging preview 2026-10-30.
+func unwrapInputValue(v *scpluginv1.InputValue) any {
+	if v == nil {
+		return nil
+	}
+	switch x := v.GetValue().(type) {
+	case *scpluginv1.InputValue_StringValue:
+		return x.StringValue
+	case *scpluginv1.InputValue_BoolValue:
+		return x.BoolValue
+	case *scpluginv1.InputValue_DoubleValue:
+		return x.DoubleValue
+	case *scpluginv1.InputValue_BytesValue:
+		return string(x.BytesValue)
+	case *scpluginv1.InputValue_MapValue:
+		m := make(map[string]any, len(x.MapValue.GetFields()))
+		for k, iv := range x.MapValue.GetFields() {
+			m[k] = unwrapInputValue(iv)
+		}
+		return m
+	case *scpluginv1.InputValue_ListValue:
+		items := x.ListValue.GetItems()
+		out := make([]any, len(items))
+		for i, iv := range items {
+			out[i] = unwrapInputValue(iv)
+		}
+		return out
+	}
+	return nil
 }
 
 // waitForRef blocks until a Pulumi Output in a resource ref resolves —
