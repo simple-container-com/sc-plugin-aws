@@ -4,14 +4,15 @@ go 1.26.10
 
 require (
 	github.com/MShekow/directory-checksum v1.4.18
-	github.com/aws/aws-lambda-go v1.54.0
+	github.com/aws/aws-lambda-go v1.55.1
 	github.com/aws/aws-sdk-go-v2 v1.42.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.25
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.24
 	github.com/aws/aws-sdk-go-v2/service/cloudtrail v1.56.4
 	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.75.2
-	github.com/aws/aws-secretsmanager-caching-go/v2 v2.2.0
+	github.com/aws/aws-secretsmanager-caching-go/v2 v2.3.0
 	github.com/hashicorp/go-hclog v1.6.3
+	github.com/hashicorp/go-plugin v1.6.3
 	github.com/onsi/gomega v1.44.0
 	github.com/pkg/errors v0.9.1
 	github.com/pulumi/pulumi-aws/sdk/v6 v6.83.4
@@ -104,7 +105,6 @@ require (
 	github.com/grpc-ecosystem/grpc-opentracing v0.0.0-20180507213350-8e809c8a8645 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
-	github.com/hashicorp/go-plugin v1.6.3 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/hashicorp/hcl/v2 v2.24.0 // indirect
 	github.com/hashicorp/yamux v0.1.1 // indirect
@@ -200,3 +200,10 @@ require (
 )
 
 replace github.com/simple-container-com/sc-plugin-aws/api => ../api
+
+// Local-only replace to build the plugin against the api branch that
+// carries the ProvisionRequest.RegistrarPluginName / RegistrarType /
+// RegistrarMainDomain fields and the matching NewOverrideHeaderRule /
+// ProvisionDomainForEndpoint cases on bundlePeerDispatcher. Drop this
+// once the api PR merges + releases.
+replace github.com/simple-container-com/api => /home/iasadykov/sc-wt/api-surface

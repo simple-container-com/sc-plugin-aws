@@ -51,6 +51,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	hclog "github.com/hashicorp/go-hclog"
+	hplugin "github.com/hashicorp/go-plugin"
 	"github.com/pkg/errors"
 
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -69,6 +70,21 @@ type awsPlugin struct {
 
 	mu       sync.Mutex
 	progress *scPlugin.Publisher
+	// broker is captured in SetBroker (the BrokerAware opt-in from
+	// api #509). PeerClient uses it to dial SC core's SCCore endpoint
+	// for PeerInvoke — our one way to reach the registrar plugin
+	// (cloudflare) that owns DNS for an AWS-provisioned Lambda / ECS /
+	// static-site domain.
+	broker *hplugin.GRPCBroker
+}
+
+// SetBroker implements scPlugin.BrokerAware. hashicorp/go-plugin hands
+// the broker to the plugin at GRPCServer time; scPlugin.scCloudPlugin
+// forwards it here so handlers can later call NewPeerClient.
+func (p *awsPlugin) SetBroker(b *hplugin.GRPCBroker) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.broker = b
 }
 
 func (p *awsPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
@@ -218,7 +234,21 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 	// so the plugin reconstructs the provider byte-identically from
 	// the AccountConfig embedded in the resource config. Same name,
 	// same inputs → same URN → Pulumi reuses the existing state entry.
-	provider, perr := p.buildAwsProvider(pctx, cfg, req.GetHeader().GetStackName())
+	//
+	// Provider resource name mirrors SC core's in-tree formula at
+	// pkg/clouds/pulumi/provision.go:398:
+	//     <stack.Name>--<resType>--<resName>--<env>--provider
+	// so the Pulumi URN matches byte-identically with the pre-plugin
+	// state and avoids a replace cascade on every AWS resource.
+	// Match the in-tree formula at pkg/clouds/pulumi/provision.go:398
+	// EXACTLY: Descriptor.Name = <stack>--<resType>--<resName>--<env>--provider,
+	// AND Environment is set so sdkAws.NewProvider's ToResName appends
+	// another "--<env>" to the resource key — yielding the URN
+	// "<stack>--<resType>--<resName>--<env>--provider--<env>" the
+	// pre-plugin state already holds.
+	providerResName := fmt.Sprintf("%s--%s--%s--%s--provider",
+		req.GetHeader().GetStackName(), req.GetResourceType(), req.GetResourceName(), req.GetHeader().GetEnvironment())
+	provider, perr := p.buildAwsProvider(pctx, cfg, req.GetHeader().GetStackName(), providerResName, req.GetHeader().GetEnvironment())
 	if perr != nil {
 		return nil, errors.Wrap(perr, "build aws provider inside plugin pctx")
 	}
@@ -228,6 +258,27 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		ComputeContext:   newCapturingCollector(),
 		Provider:         provider,
 		BaseEnvVariables: map[string]string{},
+	}
+
+	// Bridge the registrar across the bus if the deploying stack has
+	// one. SC core packs the registrar's plugin coordinates in the
+	// request (sidecar fills them from a *pluginRegistrar it already
+	// built); the AWS Lambda / static-site drivers can then call
+	// params.Registrar.ProvisionDomainForEndpoint without caring that
+	// cloudflare lives in another process.
+	if rpn := req.GetRegistrarPluginName(); rpn != "" {
+		p.mu.Lock()
+		broker := p.broker
+		p.mu.Unlock()
+		if broker == nil {
+			return nil, errors.New("registrar bridge requested but SetBroker was never called; plugin wiring is broken")
+		}
+		peer, perr := scPlugin.NewPeerClient(ctx, broker, req.GetHeader())
+		if perr != nil {
+			return nil, errors.Wrap(perr, "open PeerClient to SC core for registrar bridge")
+		}
+		defer peer.Close()
+		params.Registrar = newSCCoreRegistrar(peer, req.GetHeader(), rpn, req.GetRegistrarType(), req.GetRegistrarMainDomain())
 	}
 	out, err := fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, params)
 	if err != nil {
@@ -419,7 +470,7 @@ func (p *awsPlugin) LogStream(_ *scpluginv1.LogStreamRequest, stream scpluginv1.
 // resource config. The provider name mirrors
 // `input.ToResName(req.ProviderResourceName)` SC core uses — the
 // convention is `<provider-type>--<env>` for the registered provider.
-func (p *awsPlugin) buildAwsProvider(pctx *sdk.Context, cfg any, stackName string) (sdk.ProviderResource, error) {
+func (p *awsPlugin) buildAwsProvider(pctx *sdk.Context, cfg any, stackName, providerResName, environment string) (sdk.ProviderResource, error) {
 	authCfg, ok := cfg.(api.AuthConfig)
 	if !ok {
 		return nil, errors.Errorf("decoded config (%T) does not implement api.AuthConfig — cannot derive AWS credentials", cfg)
@@ -433,12 +484,12 @@ func (p *awsPlugin) buildAwsProvider(pctx *sdk.Context, cfg any, stackName strin
 	providerInput := api.ResourceInput{
 		Descriptor: &api.ResourceDescriptor{
 			Type:   awsApi.ProviderType,
-			Name:   awsApi.ProviderType,
+			Name:   providerResName,
 			Config: api.Config{Config: &accountCfg},
 		},
 		StackParams: &api.StackParams{
 			StackName:   stackName,
-			Environment: pctx.Stack(),
+			Environment: environment,
 		},
 	}
 	out, err := awsInternal.Provider(pctx, api.Stack{Name: stackName}, providerInput, pApi.ProvisionParams{Log: logger.New(), ComputeContext: newCapturingCollector()})
