@@ -149,7 +149,7 @@ func (p *awsPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderReques
 			Environment: req.GetHeader().GetEnvironment(),
 		},
 	}
-	out, err := awsInternal.Provider(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New()})
+	out, err := awsInternal.Provider(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New(), ComputeContext: newCapturingCollector()})
 	if err != nil {
 		p.progress.Error("provider", err.Error())
 		return nil, err
@@ -174,7 +174,13 @@ var provisionDispatch = map[string]provisionFunc{
 	awsApi.SecretsProviderTypeAwsKms:            awsInternal.KmsKeySecretsProvider,
 }
 
-func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (*scpluginv1.ProvisionResponse, error) {
+func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequest) (resp *scpluginv1.ProvisionResponse, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "sc-plugin-aws Provision panic: %v\n", r)
+			err = fmt.Errorf("sc-plugin-aws Provision panic: %v", r)
+		}
+	}()
 	fn, ok := provisionDispatch[req.GetResourceType()]
 	if !ok {
 		return nil, errors.Errorf("sc-plugin-aws does not know how to provision %q", req.GetResourceType())
@@ -203,7 +209,7 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 			Environment: req.GetHeader().GetEnvironment(),
 		},
 	}
-	out, err := fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New()})
+	out, err := fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New(), ComputeContext: newCapturingCollector()})
 	if err != nil {
 		p.progress.Error("provision", err.Error())
 		return nil, err
