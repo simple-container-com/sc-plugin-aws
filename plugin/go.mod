@@ -22,7 +22,7 @@ require (
 	github.com/pulumi/pulumi-random/sdk/v4 v4.21.0
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
 	github.com/samber/lo v1.53.0
-	github.com/simple-container-com/api v0.0.0-20261029162135-7b0b0ee2bbfc
+	github.com/simple-container-com/api v0.0.0-20261030131545-7d88543d7487
 	github.com/simple-container-com/sc-plugin-aws/api v0.0.0
 	github.com/spf13/afero v1.15.0
 	github.com/spf13/cobra v1.10.2
@@ -200,10 +200,3 @@ require (
 )
 
 replace github.com/simple-container-com/sc-plugin-aws/api => ../api
-
-// Local-only replace to build the plugin against the api branch that
-// carries the ProvisionRequest.RegistrarPluginName / RegistrarType /
-// RegistrarMainDomain fields and the matching NewOverrideHeaderRule /
-// ProvisionDomainForEndpoint cases on bundlePeerDispatcher. Drop this
-// once the api PR merges + releases.
-replace github.com/simple-container-com/api => /home/iasadykov/sc-wt/api-surface
