@@ -89,6 +89,12 @@ func (p *awsPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scp
 			awsApi.ResourceTypeRdsPostgres,
 			awsApi.ResourceTypeRdsMysql,
 		},
+		StateStoreTypes: []string{
+			awsApi.StateStorageTypeS3Bucket,
+		},
+		SecretsProviderTypes: []string{
+			awsApi.SecretsProviderTypeAwsKms,
+		},
 		PulumiPlugins: []*scpluginv1.PulumiPluginRequirement{
 			// pulumi-aws is the big one (~75 MB in the module cache).
 			// Pin against api/go.mod — bumping either side without the
@@ -265,6 +271,41 @@ func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeP
 	resp := collector.ToResponse()
 	p.progress.Info("compute-process", fmt.Sprintf("emitted %d env var(s) + %d tpl extension(s)", len(resp.GetEnvVars()), len(resp.GetTplExtensions())))
 	return resp, nil
+}
+
+// InitStateStore — pre-engine. SC core calls this before the Pulumi
+// Automation API opens the workspace. The driver sets AWS_* env vars
+// in-process (SC core and the plugin share the engine process via
+// hashicorp/go-plugin) and returns the s3:// backend URL SC core wires
+// into the workspace.
+func (p *awsPlugin) InitStateStore(ctx context.Context, req *scpluginv1.InitStateStoreRequest) (*scpluginv1.InitStateStoreResponse, error) {
+	cfg := &awsApi.StateStorageConfig{}
+	if err := decodeInputsAs(req.GetConfig(), cfg); err != nil {
+		return nil, errors.Wrap(err, "decode StateStorageConfig")
+	}
+	p.progress.Info("state-store", fmt.Sprintf("configuring s3-bucket backend (bucket=%q region=%q)", cfg.BucketName, cfg.Region))
+	if err := awsInternal.InitStateStore(ctx, cfg, logger.New()); err != nil {
+		p.progress.Error("state-store", err.Error())
+		return nil, err
+	}
+	return &scpluginv1.InitStateStoreResponse{BackendUrl: cfg.StorageUrl()}, nil
+}
+
+// InitSecretsProvider — pre-engine. SC core calls this before the Pulumi
+// Automation API opens the workspace. Returns the awskms:// URL from the
+// configured KeyName; the Pulumi stack secrets-provider rides AWS KMS
+// via the ambient credential chain (same env the InitStateStore step
+// set up — SC core calls InitStateStore first).
+func (p *awsPlugin) InitSecretsProvider(_ context.Context, req *scpluginv1.InitSecretsProviderRequest) (*scpluginv1.InitSecretsProviderResponse, error) {
+	cfg := &awsApi.SecretsProviderConfig{}
+	if err := decodeInputsAs(req.GetConfig(), cfg); err != nil {
+		return nil, errors.Wrap(err, "decode SecretsProviderConfig")
+	}
+	if cfg.KeyName == "" {
+		return nil, errors.New("aws-kms secrets provider requires keyName (awskms://<key>?region=<region>)")
+	}
+	p.progress.Info("secrets-provider", fmt.Sprintf("configuring aws-kms (key=%q)", cfg.KeyName))
+	return &scpluginv1.InitSecretsProviderResponse{ProviderUrl: cfg.KeyUrl()}, nil
 }
 
 func (p *awsPlugin) PreDestroy(_ context.Context, req *scpluginv1.PreDestroyRequest) (*scpluginv1.PreDestroyResponse, error) {
