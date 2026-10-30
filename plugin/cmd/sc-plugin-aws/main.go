@@ -274,21 +274,65 @@ func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeP
 }
 
 // InitStateStore — pre-engine. SC core calls this before the Pulumi
-// Automation API opens the workspace. The driver sets AWS_* env vars
-// in-process (SC core and the plugin share the engine process via
-// hashicorp/go-plugin) and returns the s3:// backend URL SC core wires
-// into the workspace.
-func (p *awsPlugin) InitStateStore(ctx context.Context, req *scpluginv1.InitStateStoreRequest) (*scpluginv1.InitStateStoreResponse, error) {
+// Automation API opens the workspace, and uses the response to:
+// (a) set `PULUMI_BACKEND_URL` to the returned s3:// URL, and
+// (b) `os.Setenv` every key/value in `resp.Env` into SC core's
+// process (per plugin_sidecars.go makeStateStoreSidecar).
+//
+// Credentials live inside `cfg.Credentials.Credentials` as a resolved
+// JSON blob (the `${auth:aws}` reference the parent stack expanded).
+// `api.ConvertAuth` deserialises it into a populated `AccountConfig`,
+// from which we lift AWS_ACCESS_KEY, AWS_SECRET_ACCESS_KEY, and
+// AWS_DEFAULT_REGION for SC core's S3 client in `login.go` →
+// `pulumi/backend/filestate` → `gocloud.dev/blob/s3blob`.
+//
+// Setting env in the plugin's own process is NOT enough — SC core
+// and the plugin are separate OS processes under hashicorp/go-plugin,
+// so os.Setenv does not cross the boundary (live-caught on
+// forge-notifier staging redeploy 2026-10-30).
+func (p *awsPlugin) InitStateStore(_ context.Context, req *scpluginv1.InitStateStoreRequest) (*scpluginv1.InitStateStoreResponse, error) {
 	cfg := &awsApi.StateStorageConfig{}
 	if err := decodeInputsAs(req.GetConfig(), cfg); err != nil {
 		return nil, errors.Wrap(err, "decode StateStorageConfig")
 	}
-	p.progress.Info("state-store", fmt.Sprintf("configuring s3-bucket backend (bucket=%q region=%q)", cfg.BucketName, cfg.Region))
-	if err := awsInternal.InitStateStore(ctx, cfg, logger.New()); err != nil {
-		p.progress.Error("state-store", err.Error())
-		return nil, err
+
+	var creds awsApi.AccountConfig
+	if cfg.CredentialsValue() != "" {
+		if err := api.ConvertAuth(cfg, &creds); err != nil {
+			return nil, errors.Wrap(err, "convert aws-token credentials to AccountConfig")
+		}
 	}
-	return &scpluginv1.InitStateStoreResponse{BackendUrl: cfg.StorageUrl()}, nil
+	// The stack-level AccountConfig fields win over the auth-level ones
+	// (if the operator overrides them at the state-storage block).
+	if cfg.AccessKey != "" {
+		creds.AccessKey = cfg.AccessKey
+	}
+	if cfg.SecretAccessKey != "" {
+		creds.SecretAccessKey = cfg.SecretAccessKey
+	}
+	if cfg.Region != "" {
+		creds.Region = cfg.Region
+	}
+
+	p.progress.Info("state-store", fmt.Sprintf("configuring s3-bucket backend (bucket=%q region=%q)", cfg.BucketName, creds.Region))
+
+	env := map[string]*scpluginv1.InputValue{}
+	setStr := func(k, v string) {
+		if v == "" {
+			return
+		}
+		env[k] = &scpluginv1.InputValue{Value: &scpluginv1.InputValue_StringValue{StringValue: v}}
+	}
+	setStr("AWS_ACCESS_KEY", creds.AccessKey)
+	setStr("AWS_ACCESS_KEY_ID", creds.AccessKey)
+	setStr("AWS_SECRET_ACCESS_KEY", creds.SecretAccessKey)
+	setStr("AWS_DEFAULT_REGION", creds.Region)
+	setStr("AWS_REGION", creds.Region)
+
+	return &scpluginv1.InitStateStoreResponse{
+		BackendUrl: cfg.StorageUrl(),
+		Env:        env,
+	}, nil
 }
 
 // InitSecretsProvider — pre-engine. SC core calls this before the Pulumi
