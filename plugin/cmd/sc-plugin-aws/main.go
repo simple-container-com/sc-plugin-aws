@@ -232,6 +232,20 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		return nil, err
 	}
 
+	// `input.StackParams.StackName` must carry the PARENT CLI name
+	// ("forge-notifier"), not the CHILD stack name
+	// ("forge-notifier--staging"), so drivers that name resources off
+	// `deployParams.StackName` — most notably `toSecretName(deployParams, …)`
+	// in secrets.go, which produced `forge-notifier--staging--values----*`
+	// on state — keep producing byte-identical URNs post-split. The in-tree
+	// deploy path set `StackParams.StackName` to the CLI value
+	// (`params.StackName`). Fall back to `Header.StackName` when the core
+	// is pre-cli_stack_name (older SC without the field) — still CHILD,
+	// but at least non-empty.
+	cliStackName := req.GetHeader().GetCliStackName()
+	if cliStackName == "" {
+		cliStackName = req.GetHeader().GetStackName()
+	}
 	input := api.ResourceInput{
 		Descriptor: &api.ResourceDescriptor{
 			Type:   req.GetResourceType(),
@@ -239,7 +253,7 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 			Config: api.Config{Config: cfg},
 		},
 		StackParams: &api.StackParams{
-			StackName:   req.GetHeader().GetStackName(),
+			StackName:   cliStackName,
 			Environment: req.GetHeader().GetEnvironment(),
 		},
 	}
