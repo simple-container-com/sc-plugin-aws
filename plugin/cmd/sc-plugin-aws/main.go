@@ -47,6 +47,7 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -289,20 +290,21 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		params.Registrar = newSCCoreRegistrar(peer, req.GetHeader(), rpn, req.GetRegistrarType(), req.GetRegistrarMainDomain())
 	}
 	out, err := fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, params)
-	// Drain the pctx: register a dummy ComponentResource that depends on
-	// the top-level ref to force Pulumi to walk all pending ApplyT chains
-	// before we return. Without this, pulumi-aws's background goroutines
-	// resolving outputs for IAM policies, API gateway hooks, etc. can
-	// race the plugin process exit, surfacing as "waiting for RPCs: EOF"
-	// at the engine. See pulumi/sdk/v3 run.go RunWithContext for the
-	// pattern Pulumi programs use.
-	_ = pctx // kept for later use; keep handler alive while async work drains
 	if err != nil {
 		p.progress.Error("provision", err.Error())
 		return nil, err
 	}
 	urn := waitForRef(out.Ref)
 	p.progress.Info("provision", fmt.Sprintf("%s %q registered (urn=%s)", req.GetResourceType(), req.GetResourceName(), urn))
+
+	// Give pulumi-aws's background ApplyT chains a bounded window to
+	// drain their RegisterResource calls to the monitor before the
+	// gRPC handler returns and the engine finalises. The right fix is
+	// Pulumi's own ctx.wait()+monitor.SignalAndWaitForShutdown
+	// (what RunWithContext does), but both are unexported on
+	// *sdk.Context. 5s is the longest value the engine tolerates
+	// without timing out the Provision RPC in a plugin-era deploy.
+	time.Sleep(5 * time.Second)
 	return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 }
 
@@ -661,6 +663,14 @@ func waitForRef(ref any) string {
 }
 
 func main() {
+	// Redirect stderr to a file so we can see what the plugin's
+	// background goroutines write (go runtime panic traces,
+	// pulumi-aws warnings). hashicorp/go-plugin's stderr forwarding
+	// didn't surface them.
+	if f, err := os.OpenFile("/tmp/sc-plugin-aws-stderr.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		os.Stderr = f
+	}
+	_ = os.Setenv("GOTRACEBACK", "all")
 	impl := &awsPlugin{progress: scPlugin.NewPublisher(0)}
 	scPlugin.Serve(scPlugin.ServerConfig{
 		Impl: impl,
