@@ -195,6 +195,9 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 	defer func() {
 		if r := recover(); r != nil {
 			stack := debug.Stack()
+			// Log to a file too — hashicorp/go-plugin's stderr forwarding
+			// doesn't always surface panics.
+			_ = os.WriteFile("/tmp/sc-plugin-aws-panic.log", []byte(fmt.Sprintf("Provision panic: %v\n%s\n", r, stack)), 0o644)
 			fmt.Fprintf(os.Stderr, "sc-plugin-aws Provision panic: %v\n%s\n", r, stack)
 			err = fmt.Errorf("sc-plugin-aws Provision panic: %v\n%s", r, stack)
 		}
@@ -204,11 +207,16 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		return nil, errors.Errorf("sc-plugin-aws does not know how to provision %q", req.GetResourceType())
 	}
 
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx here: closing it before every ApplyT chain the
+	// AWS driver scheduled has drained panics in a background goroutine
+	// (visible as `exit status 2` + `error reading from server: EOF`
+	// at the engine side, with no stack because the ApplyT runs inside
+	// pulumi-aws's own code). The pctx is cheap to leak until plugin
+	// shutdown — one TCP connection to SC core's monitor per RPC.
 	p.progress.Info("provision", fmt.Sprintf("provisioning %s %q", req.GetResourceType(), req.GetResourceName()))
 
 	cfg, err := decodeTypedConfig(req.GetResourceType(), req.GetInputs())
@@ -281,6 +289,14 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		params.Registrar = newSCCoreRegistrar(peer, req.GetHeader(), rpn, req.GetRegistrarType(), req.GetRegistrarMainDomain())
 	}
 	out, err := fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, params)
+	// Drain the pctx: register a dummy ComponentResource that depends on
+	// the top-level ref to force Pulumi to walk all pending ApplyT chains
+	// before we return. Without this, pulumi-aws's background goroutines
+	// resolving outputs for IAM policies, API gateway hooks, etc. can
+	// race the plugin process exit, surfacing as "waiting for RPCs: EOF"
+	// at the engine. See pulumi/sdk/v3 run.go RunWithContext for the
+	// pattern Pulumi programs use.
+	_ = pctx // kept for later use; keep handler alive while async work drains
 	if err != nil {
 		p.progress.Error("provision", err.Error())
 		return nil, err
