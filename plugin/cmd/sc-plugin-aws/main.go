@@ -397,10 +397,18 @@ func decodeTypedConfig(resourceType string, inputs map[string]*scpluginv1.InputV
 	case awsApi.ResourceTypeCloudTrailSecurityAlerts:
 		cfg := &awsApi.CloudTrailSecurityAlertsConfig{}
 		return cfg, decodeInputsAs(inputs, cfg)
-	case awsApi.TemplateTypeEcsFargate,
-		awsApi.TemplateTypeAwsLambda,
-		awsApi.TemplateTypeStaticWebsite:
-		cfg := &awsApi.TemplateConfig{}
+	case awsApi.TemplateTypeEcsFargate:
+		// SC core runs ToEcsFargateConfig server-side; the Inputs
+		// map SC-core sends is the serialised *EcsFargateInput. The
+		// in-tree driver type-asserts `input.Descriptor.Config.Config`
+		// as `*EcsFargateInput`, so decode into that same shape.
+		cfg := &awsApi.EcsFargateInput{}
+		return cfg, decodeInputsAs(inputs, cfg)
+	case awsApi.TemplateTypeAwsLambda:
+		cfg := &awsApi.LambdaInput{}
+		return cfg, decodeInputsAs(inputs, cfg)
+	case awsApi.TemplateTypeStaticWebsite:
+		cfg := &awsApi.StaticSiteInput{}
 		return cfg, decodeInputsAs(inputs, cfg)
 	case awsApi.SecretsProviderTypeAwsKms:
 		cfg := &awsApi.SecretsProviderConfig{}
