@@ -42,6 +42,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
@@ -236,7 +237,16 @@ func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeP
 
 	parent := &pApi.ParentInfo{}
 	if raw := req.GetParentInfoJson(); len(raw) > 0 {
-		if err := yaml.Unmarshal(raw, parent); err != nil {
+		// json.Unmarshal (NOT yaml.Unmarshal): SC core marshals
+		// pApi.ParentInfo via json.Marshal, and the struct has no
+		// yaml tags, so a YAML read would look for lowercase keys
+		// (`stackname`, `fullreference`) while the JSON wrote them
+		// capitalized (`StackName`, `FullReference`) — every field
+		// would stay empty, and the mongodb ComputeProcessor's
+		// `<FullReference>--mongodb--<env>-id` becomes a dangling
+		// StackReference. (same bug exists in the mongodb plugin;
+		// fix independently when touching that repo.)
+		if err := json.Unmarshal(raw, parent); err != nil {
 			return nil, errors.Wrap(err, "decode ParentInfo from compute-process request")
 		}
 	}
