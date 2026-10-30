@@ -47,7 +47,6 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
-	"syscall"
 
 	"gopkg.in/yaml.v3"
 
@@ -676,15 +675,8 @@ func waitForRef(ref any) string {
 }
 
 func main() {
-	// Redirect fd 2 (the real stderr the Go runtime writes panic
-	// traces to) into a file. Just reassigning os.Stderr doesn't
-	// catch it — Go's panic handler calls write(2) at the syscall
-	// level, not through *os.File. syscall.Dup2(f.Fd(), 2) wires
-	// the kernel-side fd so panic traces land in the file too.
-	if f, err := os.OpenFile("/tmp/sc-plugin-aws-stderr.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
-		_ = syscall.Dup2(int(f.Fd()), 2)
-		os.Stderr = f
-	}
+	// Full goroutine traces on panic so a crash points at the
+	// faulting driver, not just the gRPC handler frame.
 	_ = os.Setenv("GOTRACEBACK", "all")
 	impl := &awsPlugin{progress: scPlugin.NewPublisher(0)}
 	scPlugin.Serve(scPlugin.ServerConfig{
