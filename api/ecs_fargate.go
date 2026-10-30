@@ -11,7 +11,6 @@ import (
 	"github.com/compose-spec/compose-go/types"
 	"github.com/pkg/errors"
 	"github.com/samber/lo"
-
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/clouds/compose"
 )
@@ -21,7 +20,15 @@ const (
 )
 
 type EcsFargateConfig struct {
-	api.Credentials    `json:",inline" yaml:",inline"`
+	// AccountConfig already carries an embedded `api.Credentials`
+	// via its own inline embed (see auth.go). Including BOTH here
+	// produced two struct fields with the yaml tag "credentials",
+	// which yaml.v3's decoder rejects as `duplicated key 'credentials'`
+	// — fatal panic in `decodeInputsAs` on the plugin bus the first
+	// time an ecs-fargate stack decodes through it (fleet-wide outage
+	// 2026-10-30, forge-baas `baas-meeting`/`browse` builds). The
+	// in-tree deploy path never stressed this because it didn't
+	// yaml-round-trip the struct the same way; the plugin bus does.
 	AccountConfig      `json:",inline" yaml:",inline"`
 	Cpu                int    `json:"cpu" yaml:"cpu"`
 	Memory             int    `json:"memory" yaml:"memory"`
@@ -147,13 +154,17 @@ func ToEcsFargateConfig(tpl any, composeCfg compose.Config, stackCfg *api.StackC
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to convert aws account config")
 	}
+	// Fold the template-level credentials into AccountConfig since
+	// EcsFargateConfig no longer embeds `api.Credentials` directly
+	// (its yaml:"credentials" tag collided with the one AccountConfig
+	// embeds — see type comment).
+	accountConfig.Credentials = templateCfg.Credentials
 	res := &EcsFargateInput{
 		BaseDnsZone:      stackCfg.BaseDnsZone,
 		TemplateConfig:   *templateCfg,
 		RefResourceNames: stackCfg.Uses,
 		Dependencies:     stackCfg.Dependencies,
 		Config: EcsFargateConfig{
-			Credentials:   templateCfg.Credentials,
 			AccountConfig: *accountConfig,
 			Version:       stackCfg.Version,
 		},
