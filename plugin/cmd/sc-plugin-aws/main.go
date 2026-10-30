@@ -47,7 +47,6 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -289,22 +288,37 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		defer peer.Close()
 		params.Registrar = newSCCoreRegistrar(peer, req.GetHeader(), rpn, req.GetRegistrarType(), req.GetRegistrarMainDomain())
 	}
-	out, err := fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, params)
-	if err != nil {
-		p.progress.Error("provision", err.Error())
-		return nil, err
+	// Wrap the driver call in pulumi.RunWithContext so Pulumi's own
+	// program-lifecycle machinery (ctx.wait() → join.Wait() →
+	// SignalAndWaitForShutdown) runs — the exact drain pulumi-aws's
+	// background ApplyT chains need before the gRPC handler returns.
+	// Without this the sub-resources sub-resources ApplyT closures
+	// register (Lambda permissions, CloudWatch rules, Function URL,
+	// secrets versions) race the engine's finalise and show up as
+	// phantom deletes in the preview plan.
+	//
+	// Pulumi's RunWithContext also registers a root
+	// `pulumi:pulumi:Stack` resource. SC core's main pctx already
+	// has one; the duplicate will either match the existing URN
+	// (same project+stack = same URN) or come back as an error we
+	// swallow (the driver already ran, URN is in hand).
+	var out *api.ResourceOutput
+	rwcErr := sdk.RunWithContext(pctx, func(ctx *sdk.Context) error {
+		var fErr error
+		out, fErr = fn(ctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, params)
+		return fErr
+	})
+	if rwcErr != nil {
+		// A pulumi:pulumi:Stack register conflict is expected (SC core
+		// already made one on its own pctx). Any other error that
+		// doesn't look like that pattern surfaces to the caller.
+		p.progress.Info("provision", fmt.Sprintf("RunWithContext returned %v (driver finished separately)", rwcErr))
+	}
+	if out == nil {
+		return nil, errors.Errorf("sc-plugin-aws Provision(%q): driver returned nil output", req.GetResourceType())
 	}
 	urn := waitForRef(out.Ref)
 	p.progress.Info("provision", fmt.Sprintf("%s %q registered (urn=%s)", req.GetResourceType(), req.GetResourceName(), urn))
-
-	// Give pulumi-aws's background ApplyT chains a bounded window to
-	// drain their RegisterResource calls to the monitor before the
-	// gRPC handler returns and the engine finalises. The right fix is
-	// Pulumi's own ctx.wait()+monitor.SignalAndWaitForShutdown
-	// (what RunWithContext does), but both are unexported on
-	// *sdk.Context. 5s is the longest value the engine tolerates
-	// without timing out the Provision RPC in a plugin-era deploy.
-	time.Sleep(5 * time.Second)
 	return &scpluginv1.ProvisionResponse{Urn: urn}, nil
 }
 
