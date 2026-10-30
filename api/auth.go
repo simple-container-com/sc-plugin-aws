@@ -86,8 +86,28 @@ func (sa *StateStorageConfig) IsProvisionEnabled() bool {
 	return sa.Provision
 }
 
+// ProviderType overrides the embedded AccountConfig.ProviderType ("aws")
+// with the state-storage type ("s3-bucket") so that SC core's login.go
+// state-store init lookup — `pApi.InitStateStoreFuncByType[authCfg.ProviderType()]`
+// — matches the key the plugin bus registers the sidecar under
+// (plugin_preengine.go iterates `schema.GetStateStoreTypes()` and
+// registers each as a typeToken). Without this override, the lookup
+// falls through with "could not find init state storage function for
+// provider \"aws\"" and no AWS_* env is exported, which breaks the
+// Pulumi backend open with "Invalid region" (live-caught on
+// forge-notifier staging redeploy 2026-10-30).
+func (sa *StateStorageConfig) ProviderType() string {
+	return StateStorageTypeS3Bucket
+}
+
 func (sa *SecretsProviderConfig) IsProvisionEnabled() bool {
 	return sa.Provision
+}
+
+// ProviderType — same rationale as StateStorageConfig.ProviderType, but
+// for the Pulumi stack-secrets-provider path keyed by `aws-kms`.
+func (sa *SecretsProviderConfig) ProviderType() string {
+	return SecretsProviderTypeAwsKms
 }
 
 func (sa *SecretsProviderConfig) KeyUrl() string {
