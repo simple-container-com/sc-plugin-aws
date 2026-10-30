@@ -4,6 +4,8 @@
 package main
 
 import (
+	"runtime/debug"
+
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 
@@ -12,6 +14,33 @@ import (
 	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
 )
+
+// recoverApplyT converts a panic inside an ApplyT closure into a returned
+// error carrying the message AND the stack. Pulumi's SDK does NOT recover
+// panics in `ApplyT` continuations (grep for `recover` in
+// pulumi/sdk/v3/go/{internal,pulumi}/*.go — there are none), so a panic
+// in a plugin's ApplyT closure takes the plugin process down with Go's
+// unrecovered-panic exit status 2, and the trace lands on raw stderr —
+// which `go-plugin` forwards at `hclog.Debug` and SC core currently
+// drops at its `hclog.Warn` filter (api PR #522 raises that).
+//
+// The visible symptom until both ends are fixed:
+//
+//	plugin process exited: … error="exit status 2"
+//	Provision("…"): rpc error: code = Unavailable desc = error reading from server: EOF
+//
+// — with no information about which closure panicked or why. Wrapping
+// each ApplyT body in `defer recoverApplyT(&err, name)` turns that into
+// a normal Pulumi error carried back through the Output chain, with the
+// panic value and the stack preserved in the message.
+//
+// `name` is the registrar method label so a crash in one ApplyT doesn't
+// read as a crash in another.
+func recoverApplyT(err *error, name string) {
+	if r := recover(); r != nil {
+		*err = errors.Errorf("panic in %s ApplyT: %v\n%s", name, r, debug.Stack())
+	}
+}
 
 // scCoreRegistrar is the plugin-side bridge from an AWS driver that
 // calls `params.Registrar.*` to the registrar plugin that actually
@@ -75,7 +104,8 @@ func (r *scCoreRegistrar) ProvisionRecords(_ *sdk.Context, _ pApi.ProvisionParam
 // correctly; the ApplyT on `ValueOut.ApplyT(...)` sees an empty string
 // when ValueOut is zero-state, and we use `Value` instead.
 func (r *scCoreRegistrar) NewRecord(ctx *sdk.Context, record api.DnsRecord) (*api.ResourceOutput, error) {
-	urnOut := record.ValueOut.ApplyT(func(resolvedValue string) (string, error) {
+	urnOut := record.ValueOut.ApplyT(func(resolvedValue string) (urn string, err error) {
+		defer recoverApplyT(&err, "NewRecord")
 		if resolvedValue == "" {
 			resolvedValue = record.Value
 		}
@@ -101,7 +131,8 @@ func (r *scCoreRegistrar) NewOverrideHeaderRule(ctx *sdk.Context, stack api.Stac
 	if toHost == nil {
 		toHost = sdk.String("")
 	}
-	urnOut := toHost.ToStringOutput().ApplyT(func(resolvedToHost string) (string, error) {
+	urnOut := toHost.ToStringOutput().ApplyT(func(resolvedToHost string) (urn string, err error) {
+		defer recoverApplyT(&err, "NewOverrideHeaderRule")
 		req := &scpluginv1.NewOverrideHeaderRuleRequest{
 			Header:         r.cloneHeader(),
 			RegistrarType:  r.typeToken,
@@ -138,7 +169,8 @@ func (r *scCoreRegistrar) ProvisionDomainForEndpoint(ctx *sdk.Context, stack api
 	if target == nil {
 		target = sdk.String("")
 	}
-	urnOut := target.ToStringOutput().ApplyT(func(resolvedTargetHost string) (string, error) {
+	urnOut := target.ToStringOutput().ApplyT(func(resolvedTargetHost string) (urn string, err error) {
+		defer recoverApplyT(&err, "ProvisionDomainForEndpoint")
 		req := &scpluginv1.ProvisionDomainForEndpointRequest{
 			Header:             r.cloneHeader(),
 			RegistrarType:      r.typeToken,
