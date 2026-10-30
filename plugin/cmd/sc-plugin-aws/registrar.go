@@ -135,16 +135,34 @@ func (r *scCoreRegistrar) ProvisionDomainForEndpoint(ctx *sdk.Context, stack api
 }
 
 // cloneHeader returns a header for the proxied RPC, preserving the
-// stack / env / project context the caller had but letting SC core
-// re-stamp its own monitor/engine addresses when it dispatches the
-// peer plugin.
+// stack / env / project context AND the monitor/engine/sccore
+// addresses the caller received. The SC-core PeerInvoke dispatcher
+// (pkg/clouds/pulumi/plugin_peer_dispatch.go DispatchPeer) forwards
+// the request verbatim; it does NOT re-stamp monitor/engine addresses,
+// and `Client.stampHeader` only fills `SccoreAddress` /
+// `SccoreBrokerStream`. So if the aws plugin drops `MonitorAddress`
+// here, the cloudflare plugin's `pulumiContextFromHeader` errors with
+//
+//	peer invoke cloudflare.NewDnsRecord: peer error: rpc error:
+//	code = Unknown desc = no monitor address in request header
+//
+// and every AWS stack that calls `params.Registrar.NewRecord`
+// (any `aws-lambda` / `ecs-fargate` / `aws-static-website` with a
+// `domain:`) fails to provision. Live-caught on forge-baas 2026-10-30
+// (run 41106953898), both `baas-meeting` and `browse`.
+//
+// The aws plugin's own `Provision` already received these fields on
+// its request header; forwarding them is the one-line fix.
 func (r *scCoreRegistrar) cloneHeader() *scpluginv1.RequestHeader {
 	if r.header == nil {
 		return &scpluginv1.RequestHeader{}
 	}
 	return &scpluginv1.RequestHeader{
-		StackName:   r.header.GetStackName(),
-		ProjectName: r.header.GetProjectName(),
-		Environment: r.header.GetEnvironment(),
+		MonitorAddress: r.header.GetMonitorAddress(),
+		EngineAddress:  r.header.GetEngineAddress(),
+		StackName:      r.header.GetStackName(),
+		ProjectName:    r.header.GetProjectName(),
+		Environment:    r.header.GetEnvironment(),
+		SccoreAddress:  r.header.GetSccoreAddress(),
 	}
 }
