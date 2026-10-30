@@ -56,21 +56,44 @@ func (r *scCoreRegistrar) ProvisionRecords(_ *sdk.Context, _ pApi.ProvisionParam
 	return &api.ResourceOutput{Ref: "plugin:scCoreRegistrar/ProvisionRecords:noop"}, nil
 }
 
-// NewRecord: record.Value is a plain string from server.yaml, no await.
+// NewRecord forwards the record to the registrar plugin. Driver call
+// sites pass the CNAME target as `record.ValueOut` (an sdk.StringOutput)
+// when it references a Pulumi output — ecs-fargate's
+// `LoadBalancerDNSHost`, static-website's `WebsiteEndpoint`, s3-bucket's
+// `BucketDomainName`. Only static records from server.yaml come in on
+// `record.Value` directly, and no plugin-side driver takes that path
+// today (grep: all four callers set `ValueOut`).
+//
+// Mirror the ApplyT shape used for `ProvisionDomainForEndpoint` so the
+// resolved hostname reaches the registrar plugin at continuation time
+// instead of empty-string at Provision time. Dropping to `record.Value`
+// produced a `CNAME → ""` on every ecs-fargate / static-site deploy
+// (ecs-fargate: run 41109940459, both forge-baas stacks, 2026-10-30).
+//
+// `record.Value` is folded in as a fallback — if a future call site
+// hands us a plain string record from server.yaml it still routes
+// correctly; the ApplyT on `ValueOut.ApplyT(...)` sees an empty string
+// when ValueOut is zero-state, and we use `Value` instead.
 func (r *scCoreRegistrar) NewRecord(ctx *sdk.Context, record api.DnsRecord) (*api.ResourceOutput, error) {
-	req := &scpluginv1.NewDnsRecordRequest{
-		Header:        r.cloneHeader(),
-		RegistrarType: r.typeToken,
-		RecordName:    record.Name,
-		RecordType:    record.Type,
-		ValueResolved: record.Value,
-		Proxied:       record.Proxied,
-	}
-	resp, err := r.peer.NewDnsRecord(ctx.Context(), r.pluginName, req)
-	if err != nil {
-		return nil, errors.Wrapf(err, "scCoreRegistrar.NewRecord via PeerInvoke to %q", r.pluginName)
-	}
-	return &api.ResourceOutput{Ref: resp.GetUrn()}, nil
+	urnOut := record.ValueOut.ApplyT(func(resolvedValue string) (string, error) {
+		if resolvedValue == "" {
+			resolvedValue = record.Value
+		}
+		req := &scpluginv1.NewDnsRecordRequest{
+			Header:        r.cloneHeader(),
+			RegistrarType: r.typeToken,
+			RecordName:    record.Name,
+			RecordType:    record.Type,
+			ValueResolved: resolvedValue,
+			Proxied:       record.Proxied,
+		}
+		resp, err := r.peer.NewDnsRecord(ctx.Context(), r.pluginName, req)
+		if err != nil {
+			return "", errors.Wrapf(err, "scCoreRegistrar.NewRecord via PeerInvoke to %q", r.pluginName)
+		}
+		return resp.GetUrn(), nil
+	})
+	return &api.ResourceOutput{Ref: urnOut}, nil
 }
 
 func (r *scCoreRegistrar) NewOverrideHeaderRule(ctx *sdk.Context, stack api.Stack, rule pApi.OverrideHeaderRule) (*api.ResourceOutput, error) {
