@@ -16,13 +16,18 @@ import (
 )
 
 // recoverApplyT converts a panic inside an ApplyT closure into a returned
-// error carrying the message AND the stack. Pulumi's SDK does NOT recover
-// panics in `ApplyT` continuations (grep for `recover` in
-// pulumi/sdk/v3/go/{internal,pulumi}/*.go — there are none), so a panic
-// in a plugin's ApplyT closure takes the plugin process down with Go's
-// unrecovered-panic exit status 2, and the trace lands on raw stderr —
-// which `go-plugin` forwards at `hclog.Debug` and SC core currently
-// drops at its `hclog.Warn` filter (api PR #522 raises that).
+// error carrying the message AND the stack. Pulumi SDK **v3.245.0** (the
+// version this plugin's `plugin/go.mod` currently pins) does NOT recover
+// panics in `ApplyT` continuations — grep for `recover(` in
+// pulumi/sdk/v3@v3.245.0/go/{internal,pulumi}/*.go returns zero hits.
+// This can change in a later SDK; if you upgrade the pin, re-grep before
+// deciding this wrapper is redundant.
+//
+// With the current SDK: a panic inside an ApplyT closure takes the plugin
+// process down with Go's unrecovered-panic exit status 2, and the trace
+// lands on raw stderr — which `go-plugin` forwards at `hclog.Debug` and
+// SC core currently drops at its `hclog.Warn` filter (api PR #522 raises
+// that).
 //
 // The visible symptom until both ends are fixed:
 //
