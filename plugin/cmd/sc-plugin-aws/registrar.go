@@ -135,8 +135,8 @@ func (r *scCoreRegistrar) ProvisionDomainForEndpoint(ctx *sdk.Context, stack api
 }
 
 // cloneHeader returns a header for the proxied RPC, preserving the
-// stack / env / project context AND the monitor/engine/sccore
-// addresses the caller received. The SC-core PeerInvoke dispatcher
+// stack / env / project context AND the monitor/engine addresses the
+// caller received. The SC-core PeerInvoke dispatcher
 // (pkg/clouds/pulumi/plugin_peer_dispatch.go DispatchPeer) forwards
 // the request verbatim; it does NOT re-stamp monitor/engine addresses,
 // and `Client.stampHeader` only fills `SccoreAddress` /
@@ -153,6 +153,15 @@ func (r *scCoreRegistrar) ProvisionDomainForEndpoint(ctx *sdk.Context, stack api
 //
 // The aws plugin's own `Provision` already received these fields on
 // its request header; forwarding them is the one-line fix.
+//
+// Deliberately NOT forwarded: `SccoreAddress` / `SccoreBrokerStream`.
+// Each spawned plugin has its own loopback SCCore listener
+// (`pkg/plugin/client.go` "One listener per plugin"), and
+// `Client.stampHeader` fills these ONLY if empty — so copying aws's
+// value here would overwrite cloudflare's own, pointing cloudflare's
+// callbacks at an sccore listener owned by aws's Client lifecycle.
+// Harmless today (dispatch routes by plugin name), but the mechanism
+// exists precisely so sidecars don't have to remember this.
 func (r *scCoreRegistrar) cloneHeader() *scpluginv1.RequestHeader {
 	if r.header == nil {
 		return &scpluginv1.RequestHeader{}
@@ -163,6 +172,5 @@ func (r *scCoreRegistrar) cloneHeader() *scpluginv1.RequestHeader {
 		StackName:      r.header.GetStackName(),
 		ProjectName:    r.header.GetProjectName(),
 		Environment:    r.header.GetEnvironment(),
-		SccoreAddress:  r.header.GetSccoreAddress(),
 	}
 }
