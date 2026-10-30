@@ -47,20 +47,20 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
+	"syscall"
 
 	"gopkg.in/yaml.v3"
 
 	hclog "github.com/hashicorp/go-hclog"
 	hplugin "github.com/hashicorp/go-plugin"
 	"github.com/pkg/errors"
-
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+
 	awsApi "github.com/simple-container-com/sc-plugin-aws/api"
 	awsInternal "github.com/simple-container-com/sc-plugin-aws/plugin/internal"
 )
@@ -131,8 +131,17 @@ func (p *awsPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.R
 	if h.GetMonitorAddress() == "" {
 		return nil, nil, errors.New("no monitor address in request header")
 	}
+	// EngineAddr is required for ctx.Log to work: without it, logState's
+	// engine conn is nil and ctx.Log.Warn / Info panic with a nil deref
+	// deep inside pulumi/sdk/v3/go/pulumi/log.go:_log. pulumi-aws's
+	// drivers call Log on resolve paths (resolveDeployImageRef in
+	// pkg/clouds/pulumi/docker/build_and_push.go uses it when deploying
+	// a tag because no immutable digest resolved), so a missing
+	// EngineAddr turns into a background goroutine panic that exits
+	// status 2 → SC core's engine sees "waiting for RPCs: EOF".
 	pctx, err := sdk.NewContext(ctx, sdk.RunInfo{
 		MonitorAddr: h.GetMonitorAddress(),
+		EngineAddr:  h.GetEngineAddress(),
 		Project:     h.GetProjectName(),
 		Stack:       h.GetStackName(),
 	})
@@ -288,34 +297,24 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		defer peer.Close()
 		params.Registrar = newSCCoreRegistrar(peer, req.GetHeader(), rpn, req.GetRegistrarType(), req.GetRegistrarMainDomain())
 	}
-	// Wrap the driver call in pulumi.RunWithContext so Pulumi's own
-	// program-lifecycle machinery (ctx.wait() → join.Wait() →
-	// SignalAndWaitForShutdown) runs — the exact drain pulumi-aws's
-	// background ApplyT chains need before the gRPC handler returns.
-	// Without this the sub-resources sub-resources ApplyT closures
-	// register (Lambda permissions, CloudWatch rules, Function URL,
-	// secrets versions) race the engine's finalise and show up as
-	// phantom deletes in the preview plan.
-	//
-	// Pulumi's RunWithContext also registers a root
-	// `pulumi:pulumi:Stack` resource. SC core's main pctx already
-	// has one; the duplicate will either match the existing URN
-	// (same project+stack = same URN) or come back as an error we
-	// swallow (the driver already ran, URN is in hand).
-	var out *api.ResourceOutput
-	rwcErr := sdk.RunWithContext(pctx, func(ctx *sdk.Context) error {
-		var fErr error
-		out, fErr = fn(ctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, params)
-		return fErr
-	})
-	if rwcErr != nil {
-		// A pulumi:pulumi:Stack register conflict is expected (SC core
-		// already made one on its own pctx). Any other error that
-		// doesn't look like that pattern surfaces to the caller.
-		p.progress.Info("provision", fmt.Sprintf("RunWithContext returned %v (driver finished separately)", rwcErr))
+	out, err := fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, params)
+	if err != nil {
+		p.progress.Error("provision", err.Error())
+		return nil, err
 	}
-	if out == nil {
-		return nil, errors.Errorf("sc-plugin-aws Provision(%q): driver returned nil output", req.GetResourceType())
+	// Drain the pulumi.Context before returning: RegisterResource spawns
+	// goroutines that call monitor.RegisterResource(ctx, ...) in the
+	// background, so a direct `fn(pctx, ...)` returns before any of the
+	// sub-resources (ECR, IAM role, Lambda function, schedule rules,
+	// permissions, secrets) have reached the monitor. Without this the
+	// engine's plan phase sees zero RegisterResource calls from this
+	// Provision and marks every pre-existing resource for delete.
+	// RunWithContext does the same drain but also registers a root
+	// `pulumi:pulumi:Stack` whose URN collides with SC core's — see
+	// drain.go for why we hand-roll ctx.wait() instead.
+	if werr := drainContext(pctx); werr != nil {
+		p.progress.Error("provision", "drain: "+werr.Error())
+		return nil, werr
 	}
 	urn := waitForRef(out.Ref)
 	p.progress.Info("provision", fmt.Sprintf("%s %q registered (urn=%s)", req.GetResourceType(), req.GetResourceName(), urn))
@@ -677,11 +676,13 @@ func waitForRef(ref any) string {
 }
 
 func main() {
-	// Redirect stderr to a file so we can see what the plugin's
-	// background goroutines write (go runtime panic traces,
-	// pulumi-aws warnings). hashicorp/go-plugin's stderr forwarding
-	// didn't surface them.
+	// Redirect fd 2 (the real stderr the Go runtime writes panic
+	// traces to) into a file. Just reassigning os.Stderr doesn't
+	// catch it — Go's panic handler calls write(2) at the syscall
+	// level, not through *os.File. syscall.Dup2(f.Fd(), 2) wires
+	// the kernel-side fd so panic traces land in the file too.
 	if f, err := os.OpenFile("/tmp/sc-plugin-aws-stderr.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		_ = syscall.Dup2(int(f.Fd()), 2)
 		os.Stderr = f
 	}
 	_ = os.Setenv("GOTRACEBACK", "all")
