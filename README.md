@@ -106,89 +106,60 @@ CloudTrail trail, …). The migration from in-tree to plugin preserves
 every URN. See
 [`04-no-destroy-invariant.md`](https://github.com/simple-container-com/forge/blob/main/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md).
 
-## ECS task permissions (S-03)
+## Optional ECS hardening (S-03, S-12, S-13)
 
-ECS uses separate execution and runtime roles. The execution role retains
-image-pull and logging permissions, and can read only the Secrets Manager
-ARNs created for this stack. Containers receive injected values without
-receiving Secrets Manager or ECR API permissions. The runtime role permits
-ECS Exec channels and, for mounted volumes, access to the stack's EFS filesystems.
-Both roles honor `permissionsBoundary`.
+All flags below default to `false`. An unchanged existing stack keeps the
+`origin/main` resources and properties: the shared execution/task role and its
+permissions, security group rules and attachments, HTTP listener, public-IP
+setting, and NLB without security groups. A domain alone does not enable TLS,
+so existing Cloudflare Flexible SSL configurations continue using HTTP.
 
-Existing explicit `cloudExtras.awsRoles` actions now apply only to the runtime
-role. For example, `cloudExtras: {awsRoles: ["s3:GetObject"]}` grants that action
-on `*`, preserving the existing configuration contract. Request additional
-runtime permissions deliberately; workloads relying on previously implicit
-Secrets Manager/ECR access must declare those actions. The execution role,
-policy and attachment retain their identities; task definitions roll to the
-separate runtime role without replacing the ECS service.
-
-## ECS networking (S-12)
-
-ALB tasks accept TCP only from a separate load balancer security group, on the
-ingress container port and its HTTP health-check port (if different). Other
-containers in the task communicate over localhost. EFS mount targets use their
-own security group permitting NFS only from the task group. Existing task group,
-ALB, ECS service, and mount target names are retained.
-
-Public task IPs remain enabled with the default public subnets: there is no NAT,
-so image pulls, secret injection, logs and application egress require them.
-With `staticEgressIP: true`, tasks use private subnets and NAT, with public IPs
-disabled. Direct public access to tasks is blocked by their security group.
-
-New NLBs also receive the load balancer security group and use the strict
-source-group rule. Existing NLBs were created without security groups, and AWS
-cannot attach one later without replacing the NLB. To preserve an existing NLB,
-set `cloudExtras.nlbLegacySubnetIngress: true` **before upgrading**. In that
-explicit compatibility mode, tasks accept only their target/health ports from
-the NLB subnet CIDRs. IP-target client-IP preservation must remain disabled
-(AWS's default); those CIDRs also allow other hosts in the same subnets.
-Omitting the flag for an old NLB requires replacing that NLB to attach its group;
-ALB updates do not require this flag or replacement.
-
-Existing `cloudExtras.securityGroup.ingress` now restricts the load balancer
-listeners, with no automatic subnet exceptions. Specifying either address
-family closes the other unless explicitly listed. Empty CIDR lists deny ingress.
-For example, to permit only an upstream proxy's IPv4 networks:
+These opt-ins are **recommended for new stacks**. Enabling them on an existing
+stack is an explicit migration; review its resource and permission changes first.
+Set them in the consuming stack's `cloudExtras`:
 
 ```yaml
-cloudExtras:
-  securityGroup:
-    ingress:
-      cidrBlocks: [203.0.113.0/24] # replace with your proxy's actual ranges
-      ipv6CidrBlocks: []
-```
-
-`allowOnlyCloudflare: true` also remains available; it resolves Cloudflare's
-published ranges during provisioning. Explicit CIDRs avoid that network lookup.
-
-## ECS HTTPS (S-13)
-
-With a `domain` configured, an ALB now requests an ACM certificate in the same
-AWS region, publishes its validation CNAME through the configured registrar
-with proxying disabled, and waits for ACM issuance before creating an HTTPS
-listener on 443. Keep this validation record for automatic certificate renewal.
-The existing HTTP listener on 80 keeps its resource identity and redirects to
-HTTPS with a 301, preserving host, path and query. TLS uses the
-`ELBSecurityPolicy-TLS13-1-2-2021-06` policy. Domainless ALBs retain HTTP on 80.
-
-No extra certificate config is needed:
-
-```yaml
-# In the consuming cloud-compose stack config:
 domain: app.example.com
-# Optional: restrict both listener ports to explicitly trusted proxy networks.
 cloudExtras:
-  securityGroup:
-    ingress:
-      cidrBlocks: [203.0.113.0/24] # replace with your actual proxy CIDRs
-      ipv6CidrBlocks: []
+  leastPrivilegeRoles: true
+  restrictTaskIngress: true
+  enableHTTPS: true
+  disablePublicIPWithStaticEgress: true
+  # For NEW NLB stacks only (omit for ALBs and existing NLBs):
+  # nlbSecurityGroups: true
 ```
 
-The configured registrar must control the domain and support CNAME records.
-Provisioning needs ACM certificate/validation and ELB listener permissions.
-An existing Cloudflare-proxied domain must use **Full (strict)** origin TLS;
-Flexible mode uses HTTP to the origin and would loop on the HTTPS redirect.
-The ALB and target group are retained; HTTPS adds a certificate and listener.
-NLBs retain their existing TCP service behavior; the HTTP redirect/TLS feature
-applies to ALBs, which terminate HTTP. No real-account preview was run.
+| Flag | Opt-in behavior |
+| --- | --- |
+| `leastPrivilegeRoles` | Creates a separate `<cluster>-task-role`. The existing execution role gets image-pull/logging permissions and access to this stack's secret ARNs. The runtime role gets ECS Exec channels, mounted EFS filesystem access, and explicit `awsRoles` actions. Both honor `permissionsBoundary`. |
+| `restrictTaskIngress` | Limits tasks to the ingress container and health-check ports from the load balancer group; moves the ALB to `-lb-sg` and EFS mount targets to `-efs-sg`, allowing NFS from tasks only. |
+| `nlbSecurityGroups` | Attaches `-lb-sg` to an NLB. AWS replaces an existing NLB created without security groups when this is enabled; target groups, listeners and DNS may also change. Use for new NLB stacks. |
+| `enableHTTPS` | For an ALB with a domain, requests and validates ACM, adds HTTPS on 443 and redirects HTTP on 80 to HTTPS. The single AWSX HTTP listener retains its `<load-balancer-name>-0` identity. NLB behavior is unchanged. |
+| `disablePublicIPWithStaticEgress` | Sets `assignPublicIp: false` only when `staticEgressIP: true` supplies private subnets and NAT. Otherwise public IPs stay enabled, including existing static-egress stacks without this flag. |
+
+With `leastPrivilegeRoles`, workloads requiring runtime Secrets Manager, ECR,
+CloudWatch, logs or SSM APIs must explicitly request those actions through
+`cloudExtras.awsRoles`. Enabling the flag on an existing shared-role stack can
+narrow permissions before its tasks finish rolling; plan that migration. With
+the flag omitted, the original broad policy is retained throughout deployment.
+
+With `restrictTaskIngress`, `cloudExtras.securityGroup.ingress` restricts the
+load balancer listeners. Explicit address-family lists close the other family
+unless listed; empty lists deny ingress. `allowOnlyCloudflare` resolves published
+Cloudflare ranges during provisioning. An NLB without `nlbSecurityGroups` keeps
+its existing attachment behavior; restricted tasks trust NLB subnet CIDRs on
+app/health ports (client IP preservation must remain disabled). Frontend CIDR
+and Cloudflare allowlists cannot filter NLB clients in this combination because
+the NLB has no group; use `nlbSecurityGroups` on a new NLB to enforce them.
+Hosts in those subnets can also reach those ports. Without `restrictTaskIngress`, the original
+custom security group processing and shared ALB/task/EFS group remain intact.
+
+With `enableHTTPS`, the registrar must control the domain and support CNAME
+records. The validation CNAME is DNS-only; keep it for renewal. The current
+registrar interface requires a resolved string record name/type, so ACM's
+validation record is created in `ApplyT`; registering it before that requires a
+core registrar API change. The validation waiter depends on its returned output.
+The HTTP redirect preserves host, path and query and TLS uses
+`ELBSecurityPolicy-TLS13-1-2-2021-06`. Cloudflare must use **Full (strict)** when
+enabling this flag; Flexible SSL would redirect in a loop. When omitted, no ACM
+resources, validation records, HTTPS listener or redirect are introduced.

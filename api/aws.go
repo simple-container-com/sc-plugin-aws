@@ -31,9 +31,12 @@ const (
 )
 
 type CloudExtras struct {
-	// NlbLegacySubnetIngress avoids replacing an existing NLB created without
-	// security groups. Tasks trust NLB subnet CIDRs on target/health ports.
-	NlbLegacySubnetIngress bool `json:"nlbLegacySubnetIngress,omitempty" yaml:"nlbLegacySubnetIngress,omitempty"`
+	// All hardening flags default to false to preserve existing stacks.
+	LeastPrivilegeRoles             bool `json:"leastPrivilegeRoles,omitempty" yaml:"leastPrivilegeRoles,omitempty"`
+	RestrictTaskIngress             bool `json:"restrictTaskIngress,omitempty" yaml:"restrictTaskIngress,omitempty"`
+	NlbSecurityGroups               bool `json:"nlbSecurityGroups,omitempty" yaml:"nlbSecurityGroups,omitempty"`
+	EnableHTTPS                     bool `json:"enableHTTPS,omitempty" yaml:"enableHTTPS,omitempty"`
+	DisablePublicIPWithStaticEgress bool `json:"disablePublicIPWithStaticEgress,omitempty" yaml:"disablePublicIPWithStaticEgress,omitempty"`
 
 	AwsRoles          []string          `json:"awsRoles" yaml:"awsRoles"`
 	LambdaSchedule    *LambdaSchedule   `json:"lambdaSchedule,omitempty" yaml:"lambdaSchedule,omitempty"`   // e.g. for lambda functions to be triggered on schedule
