@@ -28,7 +28,7 @@ func ecsTaskIngress(container clouds.EcsFargateContainer, source sdk.StringInput
 	return rules
 }
 
-func ecsLoadBalancerIngress(group *clouds.SecurityGroup) (ec2.SecurityGroupIngressArray, error) {
+func ecsLoadBalancerIngress(group *clouds.SecurityGroup, https bool) (ec2.SecurityGroupIngressArray, error) {
 	ipv4, ipv6 := []string{"0.0.0.0/0"}, []string{"::/0"}
 	if group != nil && group.Ingress != nil {
 		ingress := group.Ingress
@@ -57,11 +57,17 @@ func ecsLoadBalancerIngress(group *clouds.SecurityGroup) (ec2.SecurityGroupIngre
 	}
 	rules := ec2.SecurityGroupIngressArray{}
 	if len(ipv4)+len(ipv6) > 0 {
-		rules = append(rules, ec2.SecurityGroupIngressArgs{
-			Description: sdk.String("Load balancer listener"),
-			Protocol:    sdk.String("tcp"), FromPort: sdk.Int(80), ToPort: sdk.Int(80),
-			CidrBlocks: sdk.ToStringArray(ipv4), Ipv6CidrBlocks: sdk.ToStringArray(ipv6),
-		})
+		ports := []int{80}
+		if https {
+			ports = append(ports, 443)
+		}
+		for _, port := range ports {
+			rules = append(rules, ec2.SecurityGroupIngressArgs{
+				Description: sdk.String("Load balancer listener"),
+				Protocol:    sdk.String("tcp"), FromPort: sdk.Int(port), ToPort: sdk.Int(port),
+				CidrBlocks: sdk.ToStringArray(ipv4), Ipv6CidrBlocks: sdk.ToStringArray(ipv6),
+			})
+		}
 	}
 	return rules, nil
 }

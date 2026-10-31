@@ -92,6 +92,11 @@ func EcsFargate(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, para
 	if !ok {
 		return output, errors.Errorf("failed to convert ecs_fargate config for %q in stack %q in %q", input.Descriptor.Type, stack.Name, deployParams.Environment)
 	}
+	if crInput.Domain != "" {
+		if params.Registrar == nil {
+			return nil, errors.New("a DNS registrar is required for an ECS domain")
+		}
+	}
 	// This in-place ConvertAuth re-reads the credentials blob over
 	// crInput.AccountConfig (which createEcsFargateCluster reads for the role's
 	// boundary). Capture the template-level boundary first and re-assert it so
@@ -229,7 +234,7 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 	if crInput.CloudExtras != nil {
 		frontendConfig = crInput.CloudExtras.SecurityGroup
 	}
-	frontendIngress, err := ecsLoadBalancerIngress(frontendConfig)
+	frontendIngress, err := ecsLoadBalancerIngress(frontendConfig, crInput.Domain != "")
 	if err != nil {
 		return errors.Wrap(err, "invalid ECS load balancer ingress")
 	}
@@ -551,8 +556,21 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 			HealthyThreshold:   sdk.IntPtr(lo.If(liveProbe.HttpGet.HealthyThreshold > 0, liveProbe.HttpGet.HealthyThreshold).Else(3)),
 			UnhealthyThreshold: sdk.IntPtr(lo.If(liveProbe.Retries > 0, liveProbe.Retries).Else(3)),
 		}
+		var certificateARN sdk.StringOutput
+		if crInput.Domain != "" {
+			certificateARN, err = createEcsCertificate(ctx, ecsSimpleClusterName, crInput.Domain, params.Registrar, tags, opts...)
+			if err != nil {
+				return errors.Wrap(err, "failed to configure ECS TLS certificate")
+			}
+		}
+		httpListener := ecsHTTPListener(crInput.Domain != "")
+		if httpListener != nil {
+			// Wait for issuance before updating the existing HTTP listener to redirect.
+			httpListener.Port = certificateARN.ApplyT(func(string) int { return 80 }).(sdk.IntOutput)
+		}
 		applicationLoadBalancer, err = lb.NewApplicationLoadBalancer(ctx, loadBalancerName, &lb.ApplicationLoadBalancerArgs{
 			Name:      sdk.String(loadBalancerName),
+			Listener:  httpListener,
 			Tags:      tags,
 			SubnetIds: publicSubnets.Ids(),
 			DefaultTargetGroup: &lb.TargetGroupArgs{
@@ -563,6 +581,23 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 		}, opts...)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create application loadbalancer for %q in %q", stack.Name, deployParams.Environment)
+		}
+		if crInput.Domain != "" {
+			httpsListener, err := lbV6.NewListener(ctx, ecsSimpleClusterName+"-https", &lbV6.ListenerArgs{
+				LoadBalancerArn: applicationLoadBalancer.LoadBalancer.Arn(),
+				Port:            sdk.Int(443), Protocol: sdk.String("HTTPS"),
+				CertificateArn: certificateARN,
+				SslPolicy:      sdk.String("ELBSecurityPolicy-TLS13-1-2-2021-06"),
+				Tags:           tags,
+				DefaultActions: lbV6.ListenerDefaultActionArray{lbV6.ListenerDefaultActionArgs{
+					Type: sdk.String("forward"), TargetGroupArn: applicationLoadBalancer.DefaultTargetGroup.Arn(),
+				}},
+			}, opts...)
+			if err != nil {
+				return errors.Wrap(err, "failed to create ECS HTTPS listener")
+			}
+			// ECS requires the target group to be associated with a forwarding listener.
+			opts = append(opts, sdk.DependsOn([]sdk.Resource{httpsListener}))
 		}
 		ref.LoadBalancerDNSHost = lo.ToPtr(applicationLoadBalancer.LoadBalancer.DnsName())
 		ctx.Export(fmt.Sprintf("%s-alb-arn", ecsSimpleClusterName), applicationLoadBalancer.LoadBalancer.Arn())

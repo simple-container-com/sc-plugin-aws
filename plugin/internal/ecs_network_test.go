@@ -39,7 +39,7 @@ func TestEcsTasksOnlyAcceptLoadBalancerPorts(t *testing.T) {
 
 func TestEcsLoadBalancerCIDRsDoNotLeaveIPv6Open(t *testing.T) {
 	cidrs := []string{"203.0.113.0/24"}
-	rules, err := ecsLoadBalancerIngress(&clouds.SecurityGroup{Ingress: &clouds.SecurityGroupRule{CidrBlocks: &cidrs}})
+	rules, err := ecsLoadBalancerIngress(&clouds.SecurityGroup{Ingress: &clouds.SecurityGroupRule{CidrBlocks: &cidrs}}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestEcsLoadBalancerCIDRsDoNotLeaveIPv6Open(t *testing.T) {
 		}
 	}
 	empty := []string{}
-	rules, err = ecsLoadBalancerIngress(&clouds.SecurityGroup{Ingress: &clouds.SecurityGroupRule{CidrBlocks: &empty}})
+	rules, err = ecsLoadBalancerIngress(&clouds.SecurityGroup{Ingress: &clouds.SecurityGroupRule{CidrBlocks: &empty}}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

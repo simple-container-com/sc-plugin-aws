@@ -161,3 +161,34 @@ cloudExtras:
 
 `allowOnlyCloudflare: true` also remains available; it resolves Cloudflare's
 published ranges during provisioning. Explicit CIDRs avoid that network lookup.
+
+## ECS HTTPS (S-13)
+
+With a `domain` configured, an ALB now requests an ACM certificate in the same
+AWS region, publishes its validation CNAME through the configured registrar
+with proxying disabled, and waits for ACM issuance before creating an HTTPS
+listener on 443. Keep this validation record for automatic certificate renewal.
+The existing HTTP listener on 80 keeps its resource identity and redirects to
+HTTPS with a 301, preserving host, path and query. TLS uses the
+`ELBSecurityPolicy-TLS13-1-2-2021-06` policy. Domainless ALBs retain HTTP on 80.
+
+No extra certificate config is needed:
+
+```yaml
+# In the consuming cloud-compose stack config:
+domain: app.example.com
+# Optional: restrict both listener ports to explicitly trusted proxy networks.
+cloudExtras:
+  securityGroup:
+    ingress:
+      cidrBlocks: [203.0.113.0/24] # replace with your actual proxy CIDRs
+      ipv6CidrBlocks: []
+```
+
+The configured registrar must control the domain and support CNAME records.
+Provisioning needs ACM certificate/validation and ELB listener permissions.
+An existing Cloudflare-proxied domain must use **Full (strict)** origin TLS;
+Flexible mode uses HTTP to the origin and would loop on the HTTPS redirect.
+The ALB and target group are retained; HTTPS adds a certificate and listener.
+NLBs retain their existing TCP service behavior; the HTTP redirect/TLS feature
+applies to ALBs, which terminate HTTP. No real-account preview was run.
