@@ -54,6 +54,7 @@ import (
 	hplugin "github.com/hashicorp/go-plugin"
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/internals"
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
@@ -143,6 +144,11 @@ func (p *awsPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.R
 		EngineAddr:  h.GetEngineAddress(),
 		Project:     h.GetProjectName(),
 		Stack:       h.GetStackName(),
+		// DryRun landed on RequestHeader via api v2026.10.60 (api#527).
+		// aws has no `ctx.DryRun()` guard today but future preview-skip
+		// code paths need the pctx aligned with reality — same uptake
+		// shape as sc-plugin-mongodb#6, sc-plugin-cloudflare#3.
+		DryRun: h.GetDryRun(),
 	})
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "open pulumi context from monitor address")
@@ -151,11 +157,19 @@ func (p *awsPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.R
 }
 
 func (p *awsPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest) (*scpluginv1.ProviderResponse, error) {
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — same reason as Provision below and
+	// sc-plugin-mongodb's Provider handler: closing pctx cuts off any
+	// in-flight RegisterResource RPCs, which drops the plugin's URN
+	// registrations and plans a destroy of every pre-existing state
+	// entry. Explicitly the cascade bug Addendum U of
+	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+	// documents. Provider only emits one register (the aws provider
+	// URN itself) but the invariant is uniform — every RPC handler in
+	// every plugin leaks the pctx until plugin shutdown.
 	p.progress.Info("provider", fmt.Sprintf("initialising aws provider for %q", req.GetProviderResourceName()))
 
 	cfg := &awsApi.AccountConfig{}
@@ -330,8 +344,31 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		return nil, werr
 	}
 	urn := waitForRef(out.Ref)
-	p.progress.Info("provision", fmt.Sprintf("%s %q registered (urn=%s)", req.GetResourceType(), req.GetResourceName(), urn))
-	return &scpluginv1.ProvisionResponse{Urn: urn}, nil
+	// Harvest the pctx's exports and hand them back on the wire. SC core
+	// re-exports them against its OWN pctx so they land in the parent
+	// stack root's RegisterResourceOutputs call — without this,
+	// `ctx.Export(k, v)` on the plugin's pctx stays in the plugin and
+	// never reaches the parent stack root; every downstream
+	// `uses: [forge-storage]` compute-processor's
+	// `GetParentOutput(parentRef, bucketNameExport)` returns empty.
+	//
+	// Latent since the plugin split — the reason it hasn't bitten is
+	// that forge-* services deployed BEFORE the split had the s3 exports
+	// written by the in-tree code into their state, and those stale
+	// exports are still cached. Any new/re-created forge-* stack would
+	// hit the same empty lookup the mongodb side did on 2026-10-31
+	// post-cascade. Addendum V of
+	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+	// documents this as the ninth plugin-split defect.
+	//
+	// Needs SC core from api v2026.10.60+ (api#527's resp.GetOutputs()
+	// consumer). Older cores drop the field.
+	exports, exportsErr := harvestPctxExports(ctx, pctx)
+	if exportsErr != nil {
+		p.progress.Warn("provision", "harvest exports: "+exportsErr.Error())
+	}
+	p.progress.Info("provision", fmt.Sprintf("%s %q registered (urn=%s, exports=%d)", req.GetResourceType(), req.GetResourceName(), urn, len(exports)))
+	return &scpluginv1.ProvisionResponse{Urn: urn, Outputs: exports}, nil
 }
 
 // computeFunc is the shared ComputeProcessor signature.
@@ -349,11 +386,16 @@ func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeP
 		return nil, errors.Errorf("sc-plugin-aws does not expose a ComputeProcessor for %q", req.GetResourceType())
 	}
 
-	pctx, done, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	// DO NOT close pctx — same reason as Provider/Provision above.
+	// ComputeProcess invokes the per-resource compute processor
+	// (S3BucketComputeProcessor, RdsPostgresComputeProcessor, …) which
+	// may register sub-resources (DatabaseUser, IAM bindings) whose
+	// RegisterResource RPCs ride ApplyT goroutines; closing pctx on
+	// return drops those in flight.
 	p.progress.Info("compute-process", fmt.Sprintf("%s %q", req.GetResourceType(), req.GetResourceName()))
 
 	parent := &pApi.ParentInfo{}
@@ -701,4 +743,88 @@ func main() {
 			Output: os.Stderr,
 		}),
 	})
+}
+
+// harvestPctxExports reads every `pctx.Export(k, v)` call made during the
+// RPC handler and converts each value into an InputValue the wire can
+// carry. Awaits every sdk.Output so a late-resolving ApplyT chain (bucket
+// Arn, access key, etc.) lands as a concrete string on apply — remains
+// unknown during preview, which is expected.
+//
+// Verbatim port from sc-plugin-mongodb#6 — same shape, same reason, same
+// gap in the plugin split. See Addendum V of
+// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
+// for the full narrative. SC core re-exports whatever this returns onto
+// its own pctx at `plugin_sidecars.go:209` (api v2026.10.60+).
+func harvestPctxExports(ctx context.Context, pctx *sdk.Context) (map[string]*scpluginv1.InputValue, error) {
+	raw := pctx.GetCurrentExportMap()
+	out := make(map[string]*scpluginv1.InputValue, len(raw))
+	for k, v := range raw {
+		plain, err := awaitInputToPlain(ctx, v)
+		if err != nil {
+			return out, errors.Wrapf(err, "await export %q", k)
+		}
+		if iv := anyToInputValue(plain); iv != nil {
+			out[k] = iv
+		}
+	}
+	return out, nil
+}
+
+func awaitInputToPlain(ctx context.Context, v sdk.Input) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch tv := v.(type) {
+	case sdk.String:
+		return string(tv), nil
+	case sdk.Bool:
+		return bool(tv), nil
+	case sdk.Int:
+		return int(tv), nil
+	case sdk.Float64:
+		return float64(tv), nil
+	}
+	if out, ok := v.(sdk.Output); ok {
+		resolved, aerr := internals.UnsafeAwaitOutput(ctx, out)
+		if aerr != nil {
+			return nil, aerr
+		}
+		return unwrapPlain(resolved.Value), nil
+	}
+	return nil, nil
+}
+
+func unwrapPlain(v any) any {
+	switch tv := v.(type) {
+	case sdk.URN:
+		return string(tv)
+	case sdk.ID:
+		return string(tv)
+	}
+	return v
+}
+
+func anyToInputValue(v any) *scpluginv1.InputValue {
+	if v == nil {
+		return nil
+	}
+	switch sv := v.(type) {
+	case string:
+		if sv == "" {
+			return nil
+		}
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_StringValue{StringValue: sv}}
+	case bool:
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_BoolValue{BoolValue: sv}}
+	case int:
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_IntValue{IntValue: int64(sv)}}
+	case int64:
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_IntValue{IntValue: sv}}
+	case float64:
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_DoubleValue{DoubleValue: sv}}
+	case []byte:
+		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_BytesValue{BytesValue: sv}}
+	}
+	return nil
 }
