@@ -760,39 +760,50 @@ func harvestPctxExports(ctx context.Context, pctx *sdk.Context) (map[string]*scp
 	raw := pctx.GetCurrentExportMap()
 	out := make(map[string]*scpluginv1.InputValue, len(raw))
 	for k, v := range raw {
-		plain, err := awaitInputToPlain(ctx, v)
+		plain, secret, err := awaitInputToPlain(ctx, v)
 		if err != nil {
 			return out, errors.Wrapf(err, "await export %q", k)
 		}
 		if iv := anyToInputValue(plain); iv != nil {
+			iv.Secret = secret
 			out[k] = iv
 		}
 	}
 	return out, nil
 }
 
-func awaitInputToPlain(ctx context.Context, v sdk.Input) (any, error) {
+// awaitInputToPlain returns (concrete value, secret flag, error).
+// The Secret flag is CRITICAL to preserve — AccessKey.Secret, ECR auth
+// password, RDS credentials and friends come back from
+// `pulumi-aws`'s SDK as outputs marked secret, and SC core wraps the
+// re-export with `sdk.ToSecret` when this bool is true. Lose it and the
+// value lands plaintext in the parent stack root's output map,
+// `pulumi stack output` serves it as a bare string, and the apply/
+// preview logs print it clear. Live-caught 2026-10-31 on the first aws
+// harvest preview — see Addendum V of
+// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md.
+func awaitInputToPlain(ctx context.Context, v sdk.Input) (any, bool, error) {
 	if v == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	switch tv := v.(type) {
 	case sdk.String:
-		return string(tv), nil
+		return string(tv), false, nil
 	case sdk.Bool:
-		return bool(tv), nil
+		return bool(tv), false, nil
 	case sdk.Int:
-		return int(tv), nil
+		return int(tv), false, nil
 	case sdk.Float64:
-		return float64(tv), nil
+		return float64(tv), false, nil
 	}
 	if out, ok := v.(sdk.Output); ok {
 		resolved, aerr := internals.UnsafeAwaitOutput(ctx, out)
 		if aerr != nil {
-			return nil, aerr
+			return nil, false, aerr
 		}
-		return unwrapPlain(resolved.Value), nil
+		return unwrapPlain(resolved.Value), resolved.Secret, nil
 	}
-	return nil, nil
+	return nil, false, nil
 }
 
 func unwrapPlain(v any) any {
