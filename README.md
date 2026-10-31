@@ -122,3 +122,42 @@ runtime permissions deliberately; workloads relying on previously implicit
 Secrets Manager/ECR access must declare those actions. The execution role,
 policy and attachment retain their identities; task definitions roll to the
 separate runtime role without replacing the ECS service.
+
+## ECS networking (S-12)
+
+ALB tasks accept TCP only from a separate load balancer security group, on the
+ingress container port and its HTTP health-check port (if different). Other
+containers in the task communicate over localhost. EFS mount targets use their
+own security group permitting NFS only from the task group. Existing task group,
+ALB, ECS service, and mount target names are retained.
+
+Public task IPs remain enabled with the default public subnets: there is no NAT,
+so image pulls, secret injection, logs and application egress require them.
+With `staticEgressIP: true`, tasks use private subnets and NAT, with public IPs
+disabled. Direct public access to tasks is blocked by their security group.
+
+New NLBs also receive the load balancer security group and use the strict
+source-group rule. Existing NLBs were created without security groups, and AWS
+cannot attach one later without replacing the NLB. To preserve an existing NLB,
+set `cloudExtras.nlbLegacySubnetIngress: true` **before upgrading**. In that
+explicit compatibility mode, tasks accept only their target/health ports from
+the NLB subnet CIDRs. IP-target client-IP preservation must remain disabled
+(AWS's default); those CIDRs also allow other hosts in the same subnets.
+Omitting the flag for an old NLB requires replacing that NLB to attach its group;
+ALB updates do not require this flag or replacement.
+
+Existing `cloudExtras.securityGroup.ingress` now restricts the load balancer
+listeners, with no automatic subnet exceptions. Specifying either address
+family closes the other unless explicitly listed. Empty CIDR lists deny ingress.
+For example, to permit only an upstream proxy's IPv4 networks:
+
+```yaml
+cloudExtras:
+  securityGroup:
+    ingress:
+      cidrBlocks: [203.0.113.0/24] # replace with your proxy's actual ranges
+      ipv6CidrBlocks: []
+```
+
+`allowOnlyCloudflare: true` also remains available; it resolves Cloudflare's
+published ranges during provisioning. Explicit CIDRs avoid that network lookup.

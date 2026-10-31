@@ -223,26 +223,43 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 
 	params.Log.Info(ctx.Context(), "configure security group for ECS cluster %s...", ecsSimpleClusterName)
 	securityGroupName := fmt.Sprintf("%s-sg", ecsSimpleClusterName)
-	ingressTCPSGArgs := ec2.SecurityGroupIngressArgs{
-		Description:    sdk.String("Allow ALL inbound traffic"),
-		Protocol:       sdk.String("tcp"),
-		FromPort:       sdk.Int(0),
-		ToPort:         sdk.Int(65535),
-		CidrBlocks:     sdk.StringArray{sdk.String("0.0.0.0/0")},
-		Ipv6CidrBlocks: sdk.StringArray{sdk.String("::/0")},
+	// Keep the existing task security group's identity. The new frontend group
+	// belongs only to the load balancer; task ingress references it by ID.
+	var frontendConfig *aws.SecurityGroup
+	if crInput.CloudExtras != nil {
+		frontendConfig = crInput.CloudExtras.SecurityGroup
 	}
-	if crInput.CloudExtras != nil && crInput.CloudExtras.SecurityGroup != nil {
-		ingressTCPSGArgs, err = processIngressSGArgs(&ingressTCPSGArgs, *crInput.CloudExtras.SecurityGroup, publicSubnets)
-		if err != nil {
-			return errors.Wrapf(err, "failed to apply security group configuration from cloud extras for ECS cluster %q", ecsSimpleClusterName)
+	frontendIngress, err := ecsLoadBalancerIngress(frontendConfig)
+	if err != nil {
+		return errors.Wrap(err, "invalid ECS load balancer ingress")
+	}
+	loadBalancerSG, err := ec2.NewSecurityGroup(ctx, ecsSimpleClusterName+"-lb-sg", &ec2.SecurityGroupArgs{
+		VpcId: vpcID, Tags: tags, Ingress: frontendIngress,
+		Egress: ec2.SecurityGroupEgressArray{ec2.SecurityGroupEgressArgs{
+			Protocol: sdk.String("-1"), FromPort: sdk.Int(0), ToPort: sdk.Int(0),
+			CidrBlocks:     sdk.StringArray{sdk.String("0.0.0.0/0")},
+			Ipv6CidrBlocks: sdk.StringArray{sdk.String("::/0")},
+		}},
+	}, opts...)
+	if err != nil {
+		return errors.Wrap(err, "failed to create load balancer security group")
+	}
+	taskIngress := ecsTaskIngress(iContainer, loadBalancerSG.ID())
+	// Existing NLBs created without a security group cannot acquire one in-place.
+	// Their IP targets receive NLB-subnet source addresses (client IP preservation
+	// is off). Retain that path without replacing the NLB, on target ports only.
+	if crInput.CloudExtras != nil && crInput.CloudExtras.LoadBalancerType == aws.LoadBalancerTypeNlb && crInput.CloudExtras.NlbLegacySubnetIngress {
+		for i, input := range taskIngress {
+			rule := input.(ec2.SecurityGroupIngressArgs)
+			rule.SecurityGroups = nil
+			rule.CidrBlocks = toCidrBlocksArrayInput(nil, publicSubnets, false)
+			taskIngress[i] = rule
 		}
 	}
 	securityGroup, err := ec2.NewSecurityGroup(ctx, securityGroupName, &ec2.SecurityGroupArgs{
-		VpcId: vpcID,
-		Tags:  tags,
-		Ingress: ec2.SecurityGroupIngressArray{
-			&ingressTCPSGArgs,
-		},
+		VpcId:   vpcID,
+		Tags:    tags,
+		Ingress: taskIngress,
 		Egress: ec2.SecurityGroupEgressArray{
 			&ec2.SecurityGroupEgressArgs{
 				Description:    sdk.String("Allow ALL outbound TCP traffic"),
@@ -324,6 +341,20 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 	ctx.Export(ecsSimpleClusterName+"-task-role-arn", taskRole.Arn)
 	var fileSystemARNs sdk.StringArray
 
+	var efsSG *ec2.SecurityGroup
+	if len(crInput.Volumes) > 0 {
+		efsSG, err = ec2.NewSecurityGroup(ctx, ecsSimpleClusterName+"-efs-sg", &ec2.SecurityGroupArgs{
+			VpcId: vpcID, Tags: tags,
+			Ingress: ec2.SecurityGroupIngressArray{ec2.SecurityGroupIngressArgs{
+				Protocol: sdk.String("tcp"), FromPort: sdk.Int(2049), ToPort: sdk.Int(2049),
+				SecurityGroups: sdk.StringArray{securityGroup.ID()},
+			}},
+		}, opts...)
+		if err != nil {
+			return errors.Wrap(err, "failed to create EFS security group")
+		}
+	}
+
 	var volumes ecsV6.TaskDefinitionVolumeArray
 	for _, v := range crInput.Volumes {
 		efsName := fmt.Sprintf("%s-%s-fs", ecsSimpleClusterName, v.Name)
@@ -352,7 +383,7 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 				FileSystemId: fs.ID(),
 				SubnetId:     subnet.id,
 				SecurityGroups: sdk.StringArray{
-					securityGroup.ID(),
+					efsSG.ID(),
 				},
 			}, opts...)
 		})
@@ -528,7 +559,7 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 				Name:        sdk.String(targetGroupName),
 				HealthCheck: lbHC,
 			},
-			SecurityGroups: sdk.StringArray{securityGroup.ID()},
+			SecurityGroups: sdk.StringArray{loadBalancerSG.ID()},
 		}, opts...)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create application loadbalancer for %q in %q", stack.Name, deployParams.Environment)
@@ -549,10 +580,15 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 		loadBalancerName := util.TrimStringMiddle(fmt.Sprintf("%s-%s-nlb%s", stack.Name, deployParams.Environment, crInput.Config.Version), 23, "-")
 		targetGroupName := util.TrimStringMiddle(fmt.Sprintf("%s-%s-tg%s", stack.Name, deployParams.Environment, crInput.Config.Version), 23, "-")
 
+		var nlbSecurityGroups sdk.StringArrayInput = sdk.StringArray{loadBalancerSG.ID()}
+		if crInput.CloudExtras != nil && crInput.CloudExtras.NlbLegacySubnetIngress {
+			nlbSecurityGroups = nil
+		}
 		nlb, err := lbV6.NewLoadBalancer(ctx, loadBalancerName, &lbV6.LoadBalancerArgs{
 			Subnets:          publicSubnets.Ids(),
 			Tags:             tags,
 			LoadBalancerType: sdk.String("network"),
+			SecurityGroups:   nlbSecurityGroups,
 		}, opts...)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create network loadbalancer for %q in %q", stack.Name, deployParams.Environment)
@@ -704,7 +740,8 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 			return serviceTags
 		}(),
 		NetworkConfiguration: ecsV6.ServiceNetworkConfigurationArgs{
-			AssignPublicIp: sdk.BoolPtr(true),
+			// Public subnets have no NAT; Fargate needs a public IP for egress.
+			AssignPublicIp: sdk.BoolPtr(!lo.FromPtr(lo.FromPtr(crInput.StackConfig).StaticEgressIP)),
 			SecurityGroups: sdk.StringArray{
 				securityGroup.ID(),
 			},

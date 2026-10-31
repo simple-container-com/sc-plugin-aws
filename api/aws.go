@@ -31,6 +31,10 @@ const (
 )
 
 type CloudExtras struct {
+	// NlbLegacySubnetIngress avoids replacing an existing NLB created without
+	// security groups. Tasks trust NLB subnet CIDRs on target/health ports.
+	NlbLegacySubnetIngress bool `json:"nlbLegacySubnetIngress,omitempty" yaml:"nlbLegacySubnetIngress,omitempty"`
+
 	AwsRoles          []string          `json:"awsRoles" yaml:"awsRoles"`
 	LambdaSchedule    *LambdaSchedule   `json:"lambdaSchedule,omitempty" yaml:"lambdaSchedule,omitempty"`   // e.g. for lambda functions to be triggered on schedule
 	LambdaSchedules   []LambdaSchedule  `json:"lambdaSchedules,omitempty" yaml:"lambdaSchedules,omitempty"` // e.g. for lambda functions to be triggered on schedule
