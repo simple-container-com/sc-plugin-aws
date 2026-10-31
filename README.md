@@ -105,3 +105,20 @@ resource (S3 bucket, RDS instance, ECR repo, Lambda, ECS service,
 CloudTrail trail, …). The migration from in-tree to plugin preserves
 every URN. See
 [`04-no-destroy-invariant.md`](https://github.com/simple-container-com/forge/blob/main/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md).
+
+## ECS task permissions (S-03)
+
+ECS uses separate execution and runtime roles. The execution role retains
+image-pull and logging permissions, and can read only the Secrets Manager
+ARNs created for this stack. Containers receive injected values without
+receiving Secrets Manager or ECR API permissions. The runtime role permits
+ECS Exec channels and, for mounted volumes, access to the stack's EFS filesystems.
+Both roles honor `permissionsBoundary`.
+
+Existing explicit `cloudExtras.awsRoles` actions now apply only to the runtime
+role. For example, `cloudExtras: {awsRoles: ["s3:GetObject"]}` grants that action
+on `*`, preserving the existing configuration contract. Request additional
+runtime permissions deliberately; workloads relying on previously implicit
+Secrets Manager/ECR access must declare those actions. The execution role,
+policy and attachment retain their identities; task definitions roll to the
+separate runtime role without replacing the ECS service.

@@ -4,7 +4,6 @@
 package aws
 
 import (
-	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -52,6 +51,7 @@ type ECRImage struct {
 
 type EcsFargateOutput struct {
 	Images               []*ECRImage
+	TaskRole             *iam.Role
 	ExecRole             *iam.Role
 	ExecPolicyAttachment *iam.RolePolicyAttachment
 	Service              *ecs.FargateService
@@ -311,6 +311,19 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 	ref.ExecRole = taskExecRole
 	ctx.Export(fmt.Sprintf("%s-exec-role-arn", ecsSimpleClusterName), taskExecRole.Arn)
 
+	// The existing execution role keeps its name/URN; applications get a new role.
+	taskRole, err := iam.NewRole(ctx, ecsSimpleClusterName+"-task-role", &iam.RoleArgs{
+		Tags:                tags,
+		PermissionsBoundary: permissionsBoundaryPtr(crInput.AccountConfig.PermissionsBoundary),
+		AssumeRolePolicy:    taskExecRole.AssumeRolePolicy,
+	}, opts...)
+	if err != nil {
+		return errors.Wrap(err, "failed to create ECS runtime role")
+	}
+	ref.TaskRole = taskRole
+	ctx.Export(ecsSimpleClusterName+"-task-role-arn", taskRole.Arn)
+	var fileSystemARNs sdk.StringArray
+
 	var volumes ecsV6.TaskDefinitionVolumeArray
 	for _, v := range crInput.Volumes {
 		efsName := fmt.Sprintf("%s-%s-fs", ecsSimpleClusterName, v.Name)
@@ -321,6 +334,7 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 		if err != nil {
 			return errors.Wrapf(err, "failed to create file system for persistent volume %s of stack %s", v.Name, stack.Name)
 		}
+		fileSystemARNs = append(fileSystemARNs, fs.Arn)
 		_, err = efs.NewBackupPolicy(ctx, efsName, &efs.BackupPolicyArgs{
 			BackupPolicy: efs.BackupPolicyBackupPolicyArgs{
 				Status: sdk.String("ENABLED"),
@@ -610,61 +624,46 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 			return errors.Wrapf(err, "failed to convert cloudExtras field to AWS Cloud extras format")
 		}
 	}
-	policyActions := []string{
-		"ssm:StartSession",
-		"ssmmessages:CreateControlChannel",
-		"ssmmessages:CreateDataChannel",
-		"ssmmessages:OpenControlChannel",
-		"ssmmessages:OpenDataChannel",
-		"secretsmanager:GetSecretValue",
-		"ecr:GetAuthorizationToken",
-		"ecr:DescribeImages",
-		"ecr:DescribeRepositories",
-		"ecr:BatchGetImage",
-		"ecr:BatchCheckLayerAvailability",
-		"ecr:GetDownloadUrlForLayer",
-		"logs:CreateLogStream",
-		"logs:CreateLogGroup",
-		"logs:DescribeLogStreams",
-		"logs:PutLogEvents",
-		"elasticfilesystem:ClientMount",
-		"elasticfilesystem:ClientWrite",
-		"elasticfilesystem:DescribeMountTargets",
-		"elasticfilesystem:DescribeFileSystems",
-		"cloudwatch:PutMetricData",
+	secretARNs := sdk.StringArray{}
+	for _, secret := range secrets {
+		secretARNs = append(secretARNs, secret.Secret.Arn)
 	}
-
-	params.Log.Info(ctx.Context(), "adding extra roles %q for lambda %q...", strings.Join(awsCloudExtras.AwsRoles, ","), stack.Name)
-	policyActions = append(policyActions, awsCloudExtras.AwsRoles...)
+	runtimePolicy, err := iam.NewRolePolicy(ctx, ecsSimpleClusterName+"-task-policy", &iam.RolePolicyArgs{
+		Role: taskRole.Name,
+		Policy: fileSystemARNs.ToStringArrayOutput().ApplyT(func(arns []string) string {
+			return ecsRuntimePolicy(awsCloudExtras.AwsRoles, arns)
+		}).(sdk.StringOutput),
+	}, opts...)
+	if err != nil {
+		return errors.Wrap(err, "failed to attach ECS runtime policy")
+	}
 
 	ccPolicyName := fmt.Sprintf("%s-policy", ecsSimpleClusterName)
 	ccPolicy, err := iam.NewPolicy(ctx, ccPolicyName, &iam.PolicyArgs{
-		Description: sdk.String("Allows CreateControlChannel operation and reading secrets"),
+		Description: sdk.String("Allows ECS image pulls, logging and stack secret injection"),
 		Name:        sdk.String(ccPolicyName),
 		Tags:        tags,
-		Policy: sdk.All().ApplyT(func(args []interface{}) (sdk.StringOutput, error) {
-			policy := map[string]interface{}{
-				"Version": "2012-10-17",
-				"Statement": []map[string]any{
-					{
-						"Effect":   "Allow",
-						"Resource": "*",
-						"Action":   policyActions,
-					},
-				},
-			}
-			policyJSON, err := json.Marshal(policy)
-			if err != nil {
-				return sdk.StringOutput{}, err
-			}
-			return sdk.String(policyJSON).ToStringOutput(), nil
-		}).(sdk.StringOutput),
+		Policy:      secretARNs.ToStringArrayOutput().ApplyT(ecsExecutionPolicy).(sdk.StringOutput),
 	}, opts...)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create policy for stack %q in %q", stack.Name, deployParams.Environment)
 	}
 	ref.Policy = ccPolicy
 	ctx.Export(fmt.Sprintf("%s-policy", ecsSimpleClusterName), ccPolicy.Arn)
+
+	// Preserve the existing execution-policy attachment identity.
+	execPolicyAttachmentName := fmt.Sprintf("%s-p-exec", ecsSimpleClusterName)
+	execPolicyAttachment, err := iam.NewRolePolicyAttachment(ctx, execPolicyAttachmentName, &iam.RolePolicyAttachmentArgs{
+		Role:      taskExecRole.Name,
+		PolicyArn: ccPolicy.Arn,
+	}, opts...)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create policy attachment stack %q in %q", stack.Name, deployParams.Environment)
+	}
+	ref.ExecPolicyAttachment = execPolicyAttachment
+	ctx.Export(fmt.Sprintf("%s-p-exec-arn", ecsSimpleClusterName), execPolicyAttachment.PolicyArn)
+
+	opts = append(opts, sdk.DependsOn([]sdk.Resource{execPolicyAttachment, runtimePolicy}))
 
 	params.Log.Info(ctx.Context(), "configure Fargate service for %q in %q with ingress container %q...",
 		stack.Name, deployParams.Environment, iContainer.Name)
@@ -690,7 +689,7 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 				RoleArn: taskExecRole.Arn,
 			},
 			TaskRole: &awsx.DefaultRoleWithPolicyArgs{
-				RoleArn: taskExecRole.Arn,
+				RoleArn: taskRole.Arn,
 			},
 		},
 		ForceNewDeployment:   sdk.BoolPtr(true),
@@ -718,37 +717,6 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 	}
 	ref.Service = service
 	ctx.Export(fmt.Sprintf("%s-service-name", ecsSimpleClusterName), service.Service.Name())
-
-	// Attach the service's generated policy to the task role. The ECS Fargate
-	// task definition above binds BOTH ExecutionRole and TaskRole to the same
-	// `taskExecRole` — the running container's AWS SDK and ECS's secret-pull
-	// path reach the actions through the one attachment below. There is only
-	// one role, one policy, one attachment.
-	//
-	// A second attachment was previously created inside a nested
-	// `service.TaskDefinition.ApplyT(...).ApplyT(...)` closure for the same
-	// (role, policy) pair. Pulumi treats resources instantiated inside a
-	// nested Apply closure as deferred creates whose outputs aren't registered
-	// into the resource graph, so each `pulumi up` would call `DetachRolePolicy`
-	// on the previous iteration's attachment (because the parent
-	// `service.TaskDefinition` churns on the `deployTime` tag — set on every
-	// deploy, line ~679) without a paired `AttachRolePolicy` being tracked.
-	// Net effect: the role ended every deploy with the policy detached, new
-	// tasks failed to start with `AccessDeniedException` on
-	// `secretsmanager:GetSecretValue`, and the running task kept serving
-	// traffic only until its STS credentials expired. Live-caught on
-	// baas-meeting staging after forge-baas added `cloudExtras.awsRoles` for
-	// the first time (2026-10-06; CloudTrail entry at 18:42:48 UTC).
-	execPolicyAttachmentName := fmt.Sprintf("%s-p-exec", ecsSimpleClusterName)
-	execPolicyAttachment, err := iam.NewRolePolicyAttachment(ctx, execPolicyAttachmentName, &iam.RolePolicyAttachmentArgs{
-		Role:      taskExecRole.Name,
-		PolicyArn: ccPolicy.Arn,
-	}, opts...)
-	if err != nil {
-		return errors.Wrapf(err, "failed to create policy attachment stack %q in %q", stack.Name, deployParams.Environment)
-	}
-	ref.ExecPolicyAttachment = execPolicyAttachment
-	ctx.Export(fmt.Sprintf("%s-p-exec-arn", ecsSimpleClusterName), execPolicyAttachment.PolicyArn)
 
 	params.Log.Info(ctx.Context(), "configure Cloudwatch dashboard for ecs cluster %q...", ecsClusterName)
 	if err := createEcsCloudwatchDashboard(ctx, ecsCloudwatchDashboardCfg{
