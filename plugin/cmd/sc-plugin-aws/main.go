@@ -42,7 +42,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -54,12 +53,12 @@ import (
 	hplugin "github.com/hashicorp/go-plugin"
 	"github.com/pkg/errors"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/internals"
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+	"github.com/simple-container-com/api/pkg/plugin/runtime"
 
 	awsApi "github.com/simple-container-com/sc-plugin-aws/api"
 	awsInternal "github.com/simple-container-com/sc-plugin-aws/plugin/internal"
@@ -127,49 +126,23 @@ func (p *awsPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scp
 	}, nil
 }
 
-func (p *awsPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.RequestHeader) (*sdk.Context, func(), error) {
-	if h.GetMonitorAddress() == "" {
-		return nil, nil, errors.New("no monitor address in request header")
-	}
-	// EngineAddr is required for ctx.Log to work: without it, logState's
-	// engine conn is nil and ctx.Log.Warn / Info panic with a nil deref
-	// deep inside pulumi/sdk/v3/go/pulumi/log.go:_log. pulumi-aws's
-	// drivers call Log on resolve paths (resolveDeployImageRef in
-	// pkg/clouds/pulumi/docker/build_and_push.go uses it when deploying
-	// a tag because no immutable digest resolved), so a missing
-	// EngineAddr turns into a background goroutine panic that exits
-	// status 2 → SC core's engine sees "waiting for RPCs: EOF".
-	pctx, err := sdk.NewContext(ctx, sdk.RunInfo{
-		MonitorAddr: h.GetMonitorAddress(),
-		EngineAddr:  h.GetEngineAddress(),
-		Project:     h.GetProjectName(),
-		Stack:       h.GetStackName(),
-		// DryRun landed on RequestHeader via api v2026.10.60 (api#527).
-		// aws has no `ctx.DryRun()` guard today but future preview-skip
-		// code paths need the pctx aligned with reality — same uptake
-		// shape as sc-plugin-mongodb#6, sc-plugin-cloudflare#3.
-		DryRun: h.GetDryRun(),
-	})
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "open pulumi context from monitor address")
-	}
-	return pctx, func() { pctx.Close() }, nil
+// pulumiContextFromHeader opens the handler's Pulumi context via the shared
+// api/pkg/plugin/runtime library (drain + harvest + local-engine fallback
+// moved there). WithLocalEngineFallback is required: pulumi-aws's drivers
+// call ctx.Log.* from background goroutines (resolveDeployImageRef in
+// pkg/clouds/pulumi/docker/build_and_push.go when deploying a tag that
+// has no immutable digest), and a nil engine turns that into a panic that
+// exits status 2 → SC core's engine sees "waiting for RPCs: EOF".
+func (p *awsPlugin) pulumiContextFromHeader(ctx context.Context, h *scpluginv1.RequestHeader) (*runtime.Context, error) {
+	return runtime.NewContext(ctx, h, runtime.WithLocalEngineFallback(p.progress))
 }
 
-func (p *awsPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest) (*scpluginv1.ProviderResponse, error) {
-	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+func (p *awsPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderRequest) (resp *scpluginv1.ProviderResponse, err error) {
+	rctx, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	// DO NOT close pctx — same reason as Provision below and
-	// sc-plugin-mongodb's Provider handler: closing pctx cuts off any
-	// in-flight RegisterResource RPCs, which drops the plugin's URN
-	// registrations and plans a destroy of every pre-existing state
-	// entry. Explicitly the cascade bug Addendum U of
-	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
-	// documents. Provider only emits one register (the aws provider
-	// URN itself) but the invariant is uniform — every RPC handler in
-	// every plugin leaks the pctx until plugin shutdown.
+	defer runtime.Settle(rctx, &resp, &err)
 	p.progress.Info("provider", fmt.Sprintf("initialising aws provider for %q", req.GetProviderResourceName()))
 
 	cfg := &awsApi.AccountConfig{}
@@ -188,7 +161,7 @@ func (p *awsPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderReques
 			Environment: req.GetHeader().GetEnvironment(),
 		},
 	}
-	out, err := awsInternal.Provider(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New(), ComputeContext: newCapturingCollector()})
+	out, err := awsInternal.Provider(rctx.Pulumi, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New(), ComputeContext: newCapturingCollector()})
 	if err != nil {
 		p.progress.Error("provider", err.Error())
 		return nil, err
@@ -229,16 +202,11 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		return nil, errors.Errorf("sc-plugin-aws does not know how to provision %q", req.GetResourceType())
 	}
 
-	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	rctx, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	// DO NOT close pctx here: closing it before every ApplyT chain the
-	// AWS driver scheduled has drained panics in a background goroutine
-	// (visible as `exit status 2` + `error reading from server: EOF`
-	// at the engine side, with no stack because the ApplyT runs inside
-	// pulumi-aws's own code). The pctx is cheap to leak until plugin
-	// shutdown — one TCP connection to SC core's monitor per RPC.
+	defer runtime.Settle(rctx, &resp, &err)
 	p.progress.Info("provision", fmt.Sprintf("provisioning %s %q", req.GetResourceType(), req.GetResourceName()))
 
 	cfg, err := decodeTypedConfig(req.GetResourceType(), req.GetInputs())
@@ -292,7 +260,7 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 	// pre-plugin state already holds.
 	providerResName := fmt.Sprintf("%s--%s--%s--%s--provider",
 		req.GetHeader().GetStackName(), req.GetResourceType(), req.GetResourceName(), req.GetHeader().GetEnvironment())
-	provider, perr := p.buildAwsProvider(pctx, cfg, req.GetHeader().GetStackName(), providerResName, req.GetHeader().GetEnvironment())
+	provider, perr := p.buildAwsProvider(rctx.Pulumi, cfg, req.GetHeader().GetStackName(), providerResName, req.GetHeader().GetEnvironment())
 	if perr != nil {
 		return nil, errors.Wrap(perr, "build aws provider inside plugin pctx")
 	}
@@ -324,46 +292,20 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		defer peer.Close()
 		params.Registrar = newSCCoreRegistrar(peer, req.GetHeader(), rpn, req.GetRegistrarType(), req.GetRegistrarMainDomain())
 	}
-	out, err := fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, params)
+	out, err := fn(rctx.Pulumi, api.Stack{Name: req.GetHeader().GetStackName()}, input, params)
 	if err != nil {
 		p.progress.Error("provision", err.Error())
 		return nil, err
 	}
-	// Drain the pulumi.Context before returning: RegisterResource spawns
-	// goroutines that call monitor.RegisterResource(ctx, ...) in the
-	// background, so a direct `fn(pctx, ...)` returns before any of the
-	// sub-resources (ECR, IAM role, Lambda function, schedule rules,
-	// permissions, secrets) have reached the monitor. Without this the
-	// engine's plan phase sees zero RegisterResource calls from this
-	// Provision and marks every pre-existing resource for delete.
-	// RunWithContext does the same drain but also registers a root
-	// `pulumi:pulumi:Stack` whose URN collides with SC core's — see
-	// drain.go for why we hand-roll ctx.wait() instead.
-	if werr := drainContext(pctx); werr != nil {
-		p.progress.Error("provision", "drain: "+werr.Error())
-		return nil, werr
-	}
 	urn := waitForRef(out.Ref)
-	// Harvest the pctx's exports and hand them back on the wire. SC core
-	// re-exports them against its OWN pctx so they land in the parent
-	// stack root's RegisterResourceOutputs call — without this,
-	// `ctx.Export(k, v)` on the plugin's pctx stays in the plugin and
-	// never reaches the parent stack root; every downstream
-	// `uses: [forge-storage]` compute-processor's
-	// `GetParentOutput(parentRef, bucketNameExport)` returns empty.
-	//
-	// Latent since the plugin split — the reason it hasn't bitten is
-	// that forge-* services deployed BEFORE the split had the s3 exports
-	// written by the in-tree code into their state, and those stale
-	// exports are still cached. Any new/re-created forge-* stack would
-	// hit the same empty lookup the mongodb side did on 2026-10-31
-	// post-cascade. Addendum V of
-	// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
-	// documents this as the ninth plugin-split defect.
-	//
-	// Needs SC core from api v2026.10.60+ (api#527's resp.GetOutputs()
-	// consumer). Older cores drop the field.
-	exports, exportsErr := harvestPctxExports(ctx, pctx)
+	// Harvest the pctx's exports BEFORE Settle fires. runtime.HarvestExports
+	// reads pctx.GetCurrentExportMap() which the driver populates inline;
+	// Settle then drains pending RegisterResource goroutines so the response
+	// is sent only after each export has reached the monitor. SC core
+	// re-exports them onto its OWN pctx so they land in the parent stack
+	// root — needed for every `uses: [forge-storage]` compute-processor
+	// lookup. Needs SC core >= api v2026.10.60.
+	exports, exportsErr := runtime.HarvestExports(ctx, rctx.Pulumi)
 	if exportsErr != nil {
 		p.progress.Warn("provision", "harvest exports: "+exportsErr.Error())
 	}
@@ -380,38 +322,22 @@ var computeDispatch = map[string]computeFunc{
 	awsApi.ResourceTypeRdsMysql:    awsInternal.RdsMysqlComputeProcessor,
 }
 
-func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (*scpluginv1.ComputeProcessResponse, error) {
+func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (resp *scpluginv1.ComputeProcessResponse, err error) {
 	fn, ok := computeDispatch[req.GetResourceType()]
 	if !ok {
 		return nil, errors.Errorf("sc-plugin-aws does not expose a ComputeProcessor for %q", req.GetResourceType())
 	}
 
-	pctx, _, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
+	rctx, err := p.pulumiContextFromHeader(ctx, req.GetHeader())
 	if err != nil {
 		return nil, err
 	}
-	// DO NOT close pctx — same reason as Provider/Provision above.
-	// ComputeProcess invokes the per-resource compute processor
-	// (S3BucketComputeProcessor, RdsPostgresComputeProcessor, …) which
-	// may register sub-resources (DatabaseUser, IAM bindings) whose
-	// RegisterResource RPCs ride ApplyT goroutines; closing pctx on
-	// return drops those in flight.
+	defer runtime.Settle(rctx, &resp, &err)
 	p.progress.Info("compute-process", fmt.Sprintf("%s %q", req.GetResourceType(), req.GetResourceName()))
 
-	parent := &pApi.ParentInfo{}
-	if raw := req.GetParentInfoJson(); len(raw) > 0 {
-		// json.Unmarshal (NOT yaml.Unmarshal): SC core marshals
-		// pApi.ParentInfo via json.Marshal, and the struct has no
-		// yaml tags, so a YAML read would look for lowercase keys
-		// (`stackname`, `fullreference`) while the JSON wrote them
-		// capitalized (`StackName`, `FullReference`) — every field
-		// would stay empty, and the mongodb ComputeProcessor's
-		// `<FullReference>--mongodb--<env>-id` becomes a dangling
-		// StackReference. (same bug exists in the mongodb plugin;
-		// fix independently when touching that repo.)
-		if err := json.Unmarshal(raw, parent); err != nil {
-			return nil, errors.Wrap(err, "decode ParentInfo from compute-process request")
-		}
+	parent, err := runtime.ParentInfoFromRequest(req)
+	if err != nil {
+		return nil, err
 	}
 
 	cfg, err := decodeTypedConfig(req.GetResourceType(), req.GetInputs())
@@ -419,40 +345,14 @@ func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeP
 		return nil, err
 	}
 
-	// Use the PARENT's env (ParentInfo.ParentEnv) rather than the client's
-	// own env for the StackParams here. Compute processors read their
-	// parent's exports from the parent stack root, and those export keys
-	// use the parent's env suffix — `forge-storage--staging-bucket-name`,
-	// not `forge-storage--<client-env>-bucket-name`.
-	// `input.ToResName` (api/pkg/api/server.go:147) prefers
-	// StackParams.ParentEnv over StackParams.Environment, so pre-swapping
-	// it here lets the compute processor's own code remain
-	// env-agnostic.
-	//
-	// Live-caught 2026-11-01 on forge-storage isolated deploy
-	// run 41290064279: client env `108b3f` built key
-	// `forge-storage--108b3f-bucket-name` which did not exist in the
-	// parent (parent exports under `--staging`). sc-plugin-mongodb has
-	// the equivalent swap in resourceInputFromComputeProcess; this is
-	// the aws port of the same pattern.
-	env := req.GetHeader().GetEnvironment()
-	if parent != nil && parent.ParentEnv != "" {
-		env = parent.ParentEnv
-	}
-	input := api.ResourceInput{
-		Descriptor: &api.ResourceDescriptor{
-			Type:   req.GetResourceType(),
-			Name:   req.GetResourceName(),
-			Config: api.Config{Config: cfg},
-		},
-		StackParams: &api.StackParams{
-			StackName:   req.GetHeader().GetStackName(),
-			Environment: env,
-		},
-	}
+	// Parent-env swap: compute processors read their parent's exports
+	// (`forge-storage--staging--bucket-name`) under the parent's env, not
+	// the child's. Live-caught 2026-11-01 on forge-storage isolated run
+	// 41290064279. Now in the shared runtime library.
+	input := runtime.ResourceInputForComputeProcess(req, parent, cfg)
 
 	collector := newCapturingCollector()
-	_, err = fn(pctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, collector, pApi.ProvisionParams{
+	_, err = fn(rctx.Pulumi, api.Stack{Name: req.GetHeader().GetStackName()}, input, collector, pApi.ProvisionParams{
 		Log:         logger.New(),
 		ParentStack: parent,
 	})
@@ -461,7 +361,7 @@ func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeP
 		return nil, err
 	}
 
-	resp := collector.ToResponse()
+	resp = collector.ToResponse()
 	p.progress.Info("compute-process", fmt.Sprintf("emitted %d env var(s) + %d tpl extension(s)", len(resp.GetEnvVars()), len(resp.GetTplExtensions())))
 	return resp, nil
 }
@@ -765,97 +665,8 @@ func main() {
 	})
 }
 
-// harvestPctxExports reads every `pctx.Export(k, v)` call made during the
-// RPC handler and converts each value into an InputValue the wire can
-// carry. Awaits every sdk.Output so a late-resolving ApplyT chain (bucket
-// Arn, access key, etc.) lands as a concrete string on apply — remains
-// unknown during preview, which is expected.
-//
-// Verbatim port from sc-plugin-mongodb#6 — same shape, same reason, same
-// gap in the plugin split. See Addendum V of
-// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md
-// for the full narrative. SC core re-exports whatever this returns onto
-// its own pctx at `plugin_sidecars.go:209` (api v2026.10.60+).
-func harvestPctxExports(ctx context.Context, pctx *sdk.Context) (map[string]*scpluginv1.InputValue, error) {
-	raw := pctx.GetCurrentExportMap()
-	out := make(map[string]*scpluginv1.InputValue, len(raw))
-	for k, v := range raw {
-		plain, secret, err := awaitInputToPlain(ctx, v)
-		if err != nil {
-			return out, errors.Wrapf(err, "await export %q", k)
-		}
-		if iv := anyToInputValue(plain); iv != nil {
-			iv.Secret = secret
-			out[k] = iv
-		}
-	}
-	return out, nil
-}
-
-// awaitInputToPlain returns (concrete value, secret flag, error).
-// The Secret flag is CRITICAL to preserve — AccessKey.Secret, ECR auth
-// password, RDS credentials and friends come back from
-// `pulumi-aws`'s SDK as outputs marked secret, and SC core wraps the
-// re-export with `sdk.ToSecret` when this bool is true. Lose it and the
-// value lands plaintext in the parent stack root's output map,
-// `pulumi stack output` serves it as a bare string, and the apply/
-// preview logs print it clear. Live-caught 2026-10-31 on the first aws
-// harvest preview — see Addendum V of
-// forge/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md.
-func awaitInputToPlain(ctx context.Context, v sdk.Input) (any, bool, error) {
-	if v == nil {
-		return nil, false, nil
-	}
-	switch tv := v.(type) {
-	case sdk.String:
-		return string(tv), false, nil
-	case sdk.Bool:
-		return bool(tv), false, nil
-	case sdk.Int:
-		return int(tv), false, nil
-	case sdk.Float64:
-		return float64(tv), false, nil
-	}
-	if out, ok := v.(sdk.Output); ok {
-		resolved, aerr := internals.UnsafeAwaitOutput(ctx, out)
-		if aerr != nil {
-			return nil, false, aerr
-		}
-		return unwrapPlain(resolved.Value), resolved.Secret, nil
-	}
-	return nil, false, nil
-}
-
-func unwrapPlain(v any) any {
-	switch tv := v.(type) {
-	case sdk.URN:
-		return string(tv)
-	case sdk.ID:
-		return string(tv)
-	}
-	return v
-}
-
-func anyToInputValue(v any) *scpluginv1.InputValue {
-	if v == nil {
-		return nil
-	}
-	switch sv := v.(type) {
-	case string:
-		if sv == "" {
-			return nil
-		}
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_StringValue{StringValue: sv}}
-	case bool:
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_BoolValue{BoolValue: sv}}
-	case int:
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_IntValue{IntValue: int64(sv)}}
-	case int64:
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_IntValue{IntValue: sv}}
-	case float64:
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_DoubleValue{DoubleValue: sv}}
-	case []byte:
-		return &scpluginv1.InputValue{Value: &scpluginv1.InputValue_BytesValue{BytesValue: sv}}
-	}
-	return nil
-}
+// The harvest triad (harvestPctxExports + awaitInputToPlain +
+// anyToInputValue + unwrapPlain) + drainContext are now in
+// api/pkg/plugin/runtime — same shape, Secret-flag-preserving. See
+// forge/docs/design/2026-11-01/plugin-extraction-playbook/ for the trap
+// catalogue this consolidation prevents.
