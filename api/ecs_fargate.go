@@ -349,6 +349,9 @@ func ToEcsFargateConfig(tpl any, composeCfg compose.Config, stackCfg *api.StackC
 	})
 	res.Domain = stackCfg.Domain
 	res.DomainProxied = stackCfg.DomainProxied
+	if err := res.ValidateContainerSecrets(nil); err != nil {
+		return nil, err
+	}
 
 	return res, nil
 }

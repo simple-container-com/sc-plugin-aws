@@ -10,6 +10,7 @@ import (
 
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+	awsApi "github.com/simple-container-com/sc-plugin-aws/api"
 )
 
 // capturingCollector implements pApi.ComputeContextCollector in-plugin
@@ -29,6 +30,7 @@ import (
 type capturingCollector struct {
 	mu            sync.Mutex
 	envVars       []pApi.ComputeEnvVariable
+	inputSecrets  []pApi.ComputeEnvVariable
 	resourceTpl   []resourceTplEntry
 	dependencyTpl []dependencyTplEntry
 }
@@ -48,7 +50,27 @@ func newCapturingCollector() *capturingCollector {
 	return &capturingCollector{}
 }
 
-func (c *capturingCollector) SecretEnvVariables() []pApi.ComputeEnvVariable { return nil }
+// Only scoped ECS stacks consume incoming context secrets. The legacy plugin
+// ignored ComputeEnvVars; keep unconfigured stacks and ordinary env unchanged.
+// Incoming values stay separate from outgoing compute-process mutations.
+func newProvisionCollector(req *scpluginv1.ProvisionRequest, cfg any) *capturingCollector {
+	c := newCapturingCollector()
+	ecs, ok := cfg.(*awsApi.EcsFargateInput)
+	if !ok || ecs.CloudExtras == nil || len(ecs.CloudExtras.ContainerSecrets) == 0 {
+		return c
+	}
+	for _, v := range req.GetComputeEnvVars() {
+		if v.GetSecret() {
+			c.inputSecrets = append(c.inputSecrets, pApi.ComputeEnvVariable{
+				Name: v.GetName(), Value: v.GetValue(), Secret: true,
+				ResourceName: v.GetResourceName(), ResourceType: v.GetResourceType(), StackName: v.GetStackName(),
+			})
+		}
+	}
+	return c
+}
+
+func (c *capturingCollector) SecretEnvVariables() []pApi.ComputeEnvVariable { return c.inputSecrets }
 func (c *capturingCollector) EnvVariables() []pApi.ComputeEnvVariable       { return nil }
 
 func (c *capturingCollector) AddEnvVariableIfNotExist(name, value, resType, resName, stackName string) {

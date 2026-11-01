@@ -267,7 +267,7 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 
 	params := pApi.ProvisionParams{
 		Log:              logger.New(),
-		ComputeContext:   newCapturingCollector(),
+		ComputeContext:   newProvisionCollector(req, cfg),
 		Provider:         provider,
 		BaseEnvVariables: map[string]string{},
 	}

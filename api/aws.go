@@ -31,6 +31,10 @@ const (
 )
 
 type CloudExtras struct {
+	// ContainerSecrets restricts ECS secret injection by compose service name.
+	// A missing service inherits all stack/context secrets; an empty list gets none.
+	ContainerSecrets map[string][]string `json:"containerSecrets,omitempty" yaml:"containerSecrets,omitempty"`
+
 	// All hardening flags default to false to preserve existing stacks.
 	LeastPrivilegeRoles             bool `json:"leastPrivilegeRoles,omitempty" yaml:"leastPrivilegeRoles,omitempty"`
 	RestrictTaskIngress             bool `json:"restrictTaskIngress,omitempty" yaml:"restrictTaskIngress,omitempty"`
