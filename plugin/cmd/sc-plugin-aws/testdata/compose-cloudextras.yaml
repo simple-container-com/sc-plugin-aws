@@ -1,0 +1,12 @@
+config:
+  domain: staging-app-innmind.alphamind.co
+  dockerComposeFile: ...
+  uses: [mongodb]
+  size: {cpu: 1024, memory: 2048}
+  cloudExtras:
+    leastPrivilegeRoles: true
+    restrictTaskIngress: true
+    enableHTTPS: true
+    securityGroup:
+      ingress:
+        allowOnlyCloudflare: true

@@ -636,7 +636,23 @@ func decodeTypedConfig(resourceType string, inputs map[string]*scpluginv1.InputV
 		// in-tree driver type-asserts `input.Descriptor.Config.Config`
 		// as `*EcsFargateInput`, so decode into that same shape.
 		cfg := &awsApi.EcsFargateInput{}
-		return cfg, decodeInputsAs(inputs, cfg)
+		if err := decodeInputsAs(inputs, cfg); err != nil {
+			return cfg, err
+		}
+		// Core's linked AWS /api can predate this plugin: its compose
+		// converter drops unknown fields from the typed CloudExtras, but
+		// preserves the original block in StackConfig. Decode that block
+		// with our current schema, retaining top-level fields absent from
+		// the client block and honoring explicit false values.
+		if cfg.StackConfig != nil && cfg.StackConfig.CloudExtras != nil {
+			if cfg.CloudExtras == nil {
+				cfg.CloudExtras = &awsApi.CloudExtras{}
+			}
+			if _, err := api.ConvertDescriptor(cfg.StackConfig.CloudExtras, cfg.CloudExtras); err != nil {
+				return cfg, errors.Wrap(err, "failed to convert ECS stackConfig.cloudExtras")
+			}
+		}
+		return cfg, nil
 	case awsApi.TemplateTypeAwsLambda:
 		cfg := &awsApi.LambdaInput{}
 		return cfg, decodeInputsAs(inputs, cfg)
