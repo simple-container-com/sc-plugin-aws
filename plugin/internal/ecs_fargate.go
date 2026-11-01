@@ -52,6 +52,7 @@ type ECRImage struct {
 
 type EcsFargateOutput struct {
 	Images               []*ECRImage
+	TaskRole             *iam.Role
 	ExecRole             *iam.Role
 	ExecPolicyAttachment *iam.RolePolicyAttachment
 	Service              *ecs.FargateService
@@ -91,6 +92,11 @@ func EcsFargate(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, para
 	crInput, ok := input.Descriptor.Config.Config.(*aws.EcsFargateInput)
 	if !ok {
 		return output, errors.Errorf("failed to convert ecs_fargate config for %q in stack %q in %q", input.Descriptor.Type, stack.Name, deployParams.Environment)
+	}
+	if lo.FromPtr(crInput.CloudExtras).EnableHTTPS && crInput.Domain != "" {
+		if params.Registrar == nil {
+			return nil, errors.New("a DNS registrar is required for an ECS domain")
+		}
 	}
 	// This in-place ConvertAuth re-reads the credentials blob over
 	// crInput.AccountConfig (which createEcsFargateCluster reads for the role's
@@ -157,6 +163,7 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 		opts = append(opts, img.AddOpts...)
 	}
 
+	hardening := lo.FromPtr(crInput.CloudExtras)
 	iContainer := crInput.IngressContainer
 
 	contextSecretEnvVariables := lo.Filter(params.ComputeContext.SecretEnvVariables(), func(s pApi.ComputeEnvVariable, _ int) bool {
@@ -223,26 +230,60 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 
 	params.Log.Info(ctx.Context(), "configure security group for ECS cluster %s...", ecsSimpleClusterName)
 	securityGroupName := fmt.Sprintf("%s-sg", ecsSimpleClusterName)
-	ingressTCPSGArgs := ec2.SecurityGroupIngressArgs{
-		Description:    sdk.String("Allow ALL inbound traffic"),
-		Protocol:       sdk.String("tcp"),
-		FromPort:       sdk.Int(0),
-		ToPort:         sdk.Int(65535),
-		CidrBlocks:     sdk.StringArray{sdk.String("0.0.0.0/0")},
-		Ipv6CidrBlocks: sdk.StringArray{sdk.String("::/0")},
+	// Keep the existing task security group's identity. The new frontend group
+	// belongs only to the load balancer; task ingress references it by ID.
+	var frontendConfig *aws.SecurityGroup
+	if crInput.CloudExtras != nil {
+		frontendConfig = crInput.CloudExtras.SecurityGroup
 	}
-	if crInput.CloudExtras != nil && crInput.CloudExtras.SecurityGroup != nil {
+	var loadBalancerSG *ec2.SecurityGroup
+	if hardening.RestrictTaskIngress || hardening.NlbSecurityGroups {
+		frontendIngress, err := ecsLoadBalancerIngress(frontendConfig, hardening.EnableHTTPS && crInput.Domain != "")
+		if err != nil {
+			return errors.Wrap(err, "invalid ECS load balancer ingress")
+		}
+		loadBalancerSG, err = ec2.NewSecurityGroup(ctx, ecsSimpleClusterName+"-lb-sg", &ec2.SecurityGroupArgs{
+			VpcId: vpcID, Tags: tags, Ingress: frontendIngress,
+			Egress: ec2.SecurityGroupEgressArray{ec2.SecurityGroupEgressArgs{
+				Protocol: sdk.String("-1"), FromPort: sdk.Int(0), ToPort: sdk.Int(0),
+				CidrBlocks:     sdk.StringArray{sdk.String("0.0.0.0/0")},
+				Ipv6CidrBlocks: sdk.StringArray{sdk.String("::/0")},
+			}},
+		}, opts...)
+		if err != nil {
+			return errors.Wrap(err, "failed to create load balancer security group")
+		}
+	}
+	ingressTCPSGArgs := ec2.SecurityGroupIngressArgs{
+		Description: sdk.String("Allow ALL inbound traffic"), Protocol: sdk.String("tcp"),
+		FromPort: sdk.Int(0), ToPort: sdk.Int(65535),
+		CidrBlocks: sdk.StringArray{sdk.String("0.0.0.0/0")}, Ipv6CidrBlocks: sdk.StringArray{sdk.String("::/0")},
+	}
+	if !hardening.RestrictTaskIngress && crInput.CloudExtras != nil && crInput.CloudExtras.SecurityGroup != nil {
 		ingressTCPSGArgs, err = processIngressSGArgs(&ingressTCPSGArgs, *crInput.CloudExtras.SecurityGroup, publicSubnets)
 		if err != nil {
 			return errors.Wrapf(err, "failed to apply security group configuration from cloud extras for ECS cluster %q", ecsSimpleClusterName)
 		}
 	}
+	taskIngress := ec2.SecurityGroupIngressArray{&ingressTCPSGArgs}
+	if hardening.RestrictTaskIngress {
+		taskIngress = ecsTaskIngress(iContainer, loadBalancerSG.ID())
+		// Existing NLBs created without a security group cannot acquire one in-place.
+		// Their IP targets receive NLB-subnet source addresses (client IP preservation
+		// is off). Retain that path without replacing the NLB, on target ports only.
+		if crInput.CloudExtras != nil && crInput.CloudExtras.LoadBalancerType == aws.LoadBalancerTypeNlb && !hardening.NlbSecurityGroups {
+			for i, input := range taskIngress {
+				rule := input.(ec2.SecurityGroupIngressArgs)
+				rule.SecurityGroups = nil
+				rule.CidrBlocks = toCidrBlocksArrayInput(nil, publicSubnets, false)
+				taskIngress[i] = rule
+			}
+		}
+	}
 	securityGroup, err := ec2.NewSecurityGroup(ctx, securityGroupName, &ec2.SecurityGroupArgs{
-		VpcId: vpcID,
-		Tags:  tags,
-		Ingress: ec2.SecurityGroupIngressArray{
-			&ingressTCPSGArgs,
-		},
+		VpcId:   vpcID,
+		Tags:    tags,
+		Ingress: taskIngress,
 		Egress: ec2.SecurityGroupEgressArray{
 			&ec2.SecurityGroupEgressArgs{
 				Description:    sdk.String("Allow ALL outbound TCP traffic"),
@@ -311,6 +352,36 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 	ref.ExecRole = taskExecRole
 	ctx.Export(fmt.Sprintf("%s-exec-role-arn", ecsSimpleClusterName), taskExecRole.Arn)
 
+	// The existing execution role keeps its name/URN; applications get a new role.
+	taskRole := taskExecRole
+	if hardening.LeastPrivilegeRoles {
+		taskRole, err = iam.NewRole(ctx, ecsSimpleClusterName+"-task-role", &iam.RoleArgs{
+			Tags:                tags,
+			PermissionsBoundary: permissionsBoundaryPtr(crInput.AccountConfig.PermissionsBoundary),
+			AssumeRolePolicy:    taskExecRole.AssumeRolePolicy,
+		}, opts...)
+		if err != nil {
+			return errors.Wrap(err, "failed to create ECS runtime role")
+		}
+		ref.TaskRole = taskRole
+		ctx.Export(ecsSimpleClusterName+"-task-role-arn", taskRole.Arn)
+	}
+	var fileSystemARNs sdk.StringArray
+
+	efsSG := securityGroup
+	if hardening.RestrictTaskIngress && len(crInput.Volumes) > 0 {
+		efsSG, err = ec2.NewSecurityGroup(ctx, ecsSimpleClusterName+"-efs-sg", &ec2.SecurityGroupArgs{
+			VpcId: vpcID, Tags: tags,
+			Ingress: ec2.SecurityGroupIngressArray{ec2.SecurityGroupIngressArgs{
+				Protocol: sdk.String("tcp"), FromPort: sdk.Int(2049), ToPort: sdk.Int(2049),
+				SecurityGroups: sdk.StringArray{securityGroup.ID()},
+			}},
+		}, opts...)
+		if err != nil {
+			return errors.Wrap(err, "failed to create EFS security group")
+		}
+	}
+
 	var volumes ecsV6.TaskDefinitionVolumeArray
 	for _, v := range crInput.Volumes {
 		efsName := fmt.Sprintf("%s-%s-fs", ecsSimpleClusterName, v.Name)
@@ -321,6 +392,7 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 		if err != nil {
 			return errors.Wrapf(err, "failed to create file system for persistent volume %s of stack %s", v.Name, stack.Name)
 		}
+		fileSystemARNs = append(fileSystemARNs, fs.Arn)
 		_, err = efs.NewBackupPolicy(ctx, efsName, &efs.BackupPolicyArgs{
 			BackupPolicy: efs.BackupPolicyBackupPolicyArgs{
 				Status: sdk.String("ENABLED"),
@@ -338,7 +410,7 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 				FileSystemId: fs.ID(),
 				SubnetId:     subnet.id,
 				SecurityGroups: sdk.StringArray{
-					securityGroup.ID(),
+					efsSG.ID(),
 				},
 			}, opts...)
 		})
@@ -506,18 +578,52 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 			HealthyThreshold:   sdk.IntPtr(lo.If(liveProbe.HttpGet.HealthyThreshold > 0, liveProbe.HttpGet.HealthyThreshold).Else(3)),
 			UnhealthyThreshold: sdk.IntPtr(lo.If(liveProbe.Retries > 0, liveProbe.Retries).Else(3)),
 		}
+		albSG := securityGroup
+		if hardening.RestrictTaskIngress {
+			albSG = loadBalancerSG
+		}
+		var certificateARN sdk.StringOutput
+		if hardening.EnableHTTPS && crInput.Domain != "" {
+			certificateARN, err = createEcsCertificate(ctx, ecsSimpleClusterName, crInput.Domain, params.Registrar, tags, opts...)
+			if err != nil {
+				return errors.Wrap(err, "failed to configure ECS TLS certificate")
+			}
+		}
+		httpListener := ecsHTTPListener(hardening.EnableHTTPS && crInput.Domain != "")
+		if httpListener != nil {
+			// Wait for issuance before updating the existing HTTP listener to redirect.
+			httpListener.Port = certificateARN.ApplyT(func(string) int { return 80 }).(sdk.IntOutput)
+		}
 		applicationLoadBalancer, err = lb.NewApplicationLoadBalancer(ctx, loadBalancerName, &lb.ApplicationLoadBalancerArgs{
 			Name:      sdk.String(loadBalancerName),
+			Listener:  httpListener,
 			Tags:      tags,
 			SubnetIds: publicSubnets.Ids(),
 			DefaultTargetGroup: &lb.TargetGroupArgs{
 				Name:        sdk.String(targetGroupName),
 				HealthCheck: lbHC,
 			},
-			SecurityGroups: sdk.StringArray{securityGroup.ID()},
+			SecurityGroups: sdk.StringArray{albSG.ID()},
 		}, opts...)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create application loadbalancer for %q in %q", stack.Name, deployParams.Environment)
+		}
+		if hardening.EnableHTTPS && crInput.Domain != "" {
+			httpsListener, err := lbV6.NewListener(ctx, ecsSimpleClusterName+"-https", &lbV6.ListenerArgs{
+				LoadBalancerArn: applicationLoadBalancer.LoadBalancer.Arn(),
+				Port:            sdk.Int(443), Protocol: sdk.String("HTTPS"),
+				CertificateArn: certificateARN,
+				SslPolicy:      sdk.String("ELBSecurityPolicy-TLS13-1-2-2021-06"),
+				Tags:           tags,
+				DefaultActions: lbV6.ListenerDefaultActionArray{lbV6.ListenerDefaultActionArgs{
+					Type: sdk.String("forward"), TargetGroupArn: applicationLoadBalancer.DefaultTargetGroup.Arn(),
+				}},
+			}, opts...)
+			if err != nil {
+				return errors.Wrap(err, "failed to create ECS HTTPS listener")
+			}
+			// ECS requires the target group to be associated with a forwarding listener.
+			opts = append(opts, sdk.DependsOn([]sdk.Resource{httpsListener}))
 		}
 		ref.LoadBalancerDNSHost = lo.ToPtr(applicationLoadBalancer.LoadBalancer.DnsName())
 		ctx.Export(fmt.Sprintf("%s-alb-arn", ecsSimpleClusterName), applicationLoadBalancer.LoadBalancer.Arn())
@@ -535,10 +641,15 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 		loadBalancerName := util.TrimStringMiddle(fmt.Sprintf("%s-%s-nlb%s", stack.Name, deployParams.Environment, crInput.Config.Version), 23, "-")
 		targetGroupName := util.TrimStringMiddle(fmt.Sprintf("%s-%s-tg%s", stack.Name, deployParams.Environment, crInput.Config.Version), 23, "-")
 
+		var nlbSecurityGroups sdk.StringArrayInput
+		if hardening.NlbSecurityGroups {
+			nlbSecurityGroups = sdk.StringArray{loadBalancerSG.ID()}
+		}
 		nlb, err := lbV6.NewLoadBalancer(ctx, loadBalancerName, &lbV6.LoadBalancerArgs{
 			Subnets:          publicSubnets.Ids(),
 			Tags:             tags,
 			LoadBalancerType: sdk.String("network"),
+			SecurityGroups:   nlbSecurityGroups,
 		}, opts...)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create network loadbalancer for %q in %q", stack.Name, deployParams.Environment)
@@ -610,6 +721,19 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 			return errors.Wrapf(err, "failed to convert cloudExtras field to AWS Cloud extras format")
 		}
 	}
+	var runtimePolicy *iam.RolePolicy
+	if hardening.LeastPrivilegeRoles {
+		runtimePolicy, err = iam.NewRolePolicy(ctx, ecsSimpleClusterName+"-task-policy", &iam.RolePolicyArgs{
+			Role: taskRole.Name,
+			Policy: fileSystemARNs.ToStringArrayOutput().ApplyT(func(arns []string) string {
+				return ecsRuntimePolicy(awsCloudExtras.AwsRoles, arns)
+			}).(sdk.StringOutput),
+		}, opts...)
+		if err != nil {
+			return errors.Wrap(err, "failed to attach ECS runtime policy")
+		}
+
+	}
 	policyActions := []string{
 		"ssm:StartSession",
 		"ssmmessages:CreateControlChannel",
@@ -638,7 +762,7 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 	policyActions = append(policyActions, awsCloudExtras.AwsRoles...)
 
 	ccPolicyName := fmt.Sprintf("%s-policy", ecsSimpleClusterName)
-	ccPolicy, err := iam.NewPolicy(ctx, ccPolicyName, &iam.PolicyArgs{
+	policyArgs := &iam.PolicyArgs{
 		Description: sdk.String("Allows CreateControlChannel operation and reading secrets"),
 		Name:        sdk.String(ccPolicyName),
 		Tags:        tags,
@@ -659,12 +783,39 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 			}
 			return sdk.String(policyJSON).ToStringOutput(), nil
 		}).(sdk.StringOutput),
-	}, opts...)
+	}
+
+	if hardening.LeastPrivilegeRoles {
+		secretARNs := sdk.StringArray{}
+		for _, secret := range secrets {
+			secretARNs = append(secretARNs, secret.Secret.Arn)
+		}
+		policyArgs.Description = sdk.String("Allows ECS image pulls, logging and stack secret injection")
+		policyArgs.Policy = secretARNs.ToStringArrayOutput().ApplyT(ecsExecutionPolicy).(sdk.StringOutput)
+	}
+	ccPolicy, err := iam.NewPolicy(ctx, ccPolicyName, policyArgs, opts...)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create policy for stack %q in %q", stack.Name, deployParams.Environment)
 	}
 	ref.Policy = ccPolicy
 	ctx.Export(fmt.Sprintf("%s-policy", ecsSimpleClusterName), ccPolicy.Arn)
+
+	if hardening.LeastPrivilegeRoles {
+		// Preserve the existing execution-policy attachment identity.
+		execPolicyAttachmentName := fmt.Sprintf("%s-p-exec", ecsSimpleClusterName)
+		execPolicyAttachment, err := iam.NewRolePolicyAttachment(ctx, execPolicyAttachmentName, &iam.RolePolicyAttachmentArgs{
+			Role:      taskExecRole.Name,
+			PolicyArn: ccPolicy.Arn,
+		}, opts...)
+		if err != nil {
+			return errors.Wrapf(err, "failed to create policy attachment stack %q in %q", stack.Name, deployParams.Environment)
+		}
+		ref.ExecPolicyAttachment = execPolicyAttachment
+		ctx.Export(fmt.Sprintf("%s-p-exec-arn", ecsSimpleClusterName), execPolicyAttachment.PolicyArn)
+
+		opts = append(opts, sdk.DependsOn([]sdk.Resource{execPolicyAttachment, runtimePolicy}))
+
+	}
 
 	params.Log.Info(ctx.Context(), "configure Fargate service for %q in %q with ingress container %q...",
 		stack.Name, deployParams.Environment, iContainer.Name)
@@ -690,7 +841,7 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 				RoleArn: taskExecRole.Arn,
 			},
 			TaskRole: &awsx.DefaultRoleWithPolicyArgs{
-				RoleArn: taskExecRole.Arn,
+				RoleArn: taskRole.Arn,
 			},
 		},
 		ForceNewDeployment:   sdk.BoolPtr(true),
@@ -705,7 +856,8 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 			return serviceTags
 		}(),
 		NetworkConfiguration: ecsV6.ServiceNetworkConfigurationArgs{
-			AssignPublicIp: sdk.BoolPtr(true),
+			// Preserve the legacy public-IP setting unless explicitly opted out with NAT.
+			AssignPublicIp: sdk.BoolPtr(!(hardening.DisablePublicIPWithStaticEgress && lo.FromPtr(lo.FromPtr(crInput.StackConfig).StaticEgressIP))),
 			SecurityGroups: sdk.StringArray{
 				securityGroup.ID(),
 			},
@@ -719,37 +871,19 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 	ref.Service = service
 	ctx.Export(fmt.Sprintf("%s-service-name", ecsSimpleClusterName), service.Service.Name())
 
-	// Attach the service's generated policy to the task role. The ECS Fargate
-	// task definition above binds BOTH ExecutionRole and TaskRole to the same
-	// `taskExecRole` — the running container's AWS SDK and ECS's secret-pull
-	// path reach the actions through the one attachment below. There is only
-	// one role, one policy, one attachment.
-	//
-	// A second attachment was previously created inside a nested
-	// `service.TaskDefinition.ApplyT(...).ApplyT(...)` closure for the same
-	// (role, policy) pair. Pulumi treats resources instantiated inside a
-	// nested Apply closure as deferred creates whose outputs aren't registered
-	// into the resource graph, so each `pulumi up` would call `DetachRolePolicy`
-	// on the previous iteration's attachment (because the parent
-	// `service.TaskDefinition` churns on the `deployTime` tag — set on every
-	// deploy, line ~679) without a paired `AttachRolePolicy` being tracked.
-	// Net effect: the role ended every deploy with the policy detached, new
-	// tasks failed to start with `AccessDeniedException` on
-	// `secretsmanager:GetSecretValue`, and the running task kept serving
-	// traffic only until its STS credentials expired. Live-caught on
-	// baas-meeting staging after forge-baas added `cloudExtras.awsRoles` for
-	// the first time (2026-10-06; CloudTrail entry at 18:42:48 UTC).
-	execPolicyAttachmentName := fmt.Sprintf("%s-p-exec", ecsSimpleClusterName)
-	execPolicyAttachment, err := iam.NewRolePolicyAttachment(ctx, execPolicyAttachmentName, &iam.RolePolicyAttachmentArgs{
-		Role:      taskExecRole.Name,
-		PolicyArn: ccPolicy.Arn,
-	}, opts...)
-	if err != nil {
-		return errors.Wrapf(err, "failed to create policy attachment stack %q in %q", stack.Name, deployParams.Environment)
-	}
-	ref.ExecPolicyAttachment = execPolicyAttachment
-	ctx.Export(fmt.Sprintf("%s-p-exec-arn", ecsSimpleClusterName), execPolicyAttachment.PolicyArn)
+	if !hardening.LeastPrivilegeRoles {
+		execPolicyAttachmentName := fmt.Sprintf("%s-p-exec", ecsSimpleClusterName)
+		execPolicyAttachment, err := iam.NewRolePolicyAttachment(ctx, execPolicyAttachmentName, &iam.RolePolicyAttachmentArgs{
+			Role:      taskExecRole.Name,
+			PolicyArn: ccPolicy.Arn,
+		}, opts...)
+		if err != nil {
+			return errors.Wrapf(err, "failed to create policy attachment stack %q in %q", stack.Name, deployParams.Environment)
+		}
+		ref.ExecPolicyAttachment = execPolicyAttachment
+		ctx.Export(fmt.Sprintf("%s-p-exec-arn", ecsSimpleClusterName), execPolicyAttachment.PolicyArn)
 
+	}
 	params.Log.Info(ctx.Context(), "configure Cloudwatch dashboard for ecs cluster %q...", ecsClusterName)
 	if err := createEcsCloudwatchDashboard(ctx, ecsCloudwatchDashboardCfg{
 		ecsClusterName: ecsClusterName,

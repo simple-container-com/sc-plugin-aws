@@ -31,6 +31,13 @@ const (
 )
 
 type CloudExtras struct {
+	// All hardening flags default to false to preserve existing stacks.
+	LeastPrivilegeRoles             bool `json:"leastPrivilegeRoles,omitempty" yaml:"leastPrivilegeRoles,omitempty"`
+	RestrictTaskIngress             bool `json:"restrictTaskIngress,omitempty" yaml:"restrictTaskIngress,omitempty"`
+	NlbSecurityGroups               bool `json:"nlbSecurityGroups,omitempty" yaml:"nlbSecurityGroups,omitempty"`
+	EnableHTTPS                     bool `json:"enableHTTPS,omitempty" yaml:"enableHTTPS,omitempty"`
+	DisablePublicIPWithStaticEgress bool `json:"disablePublicIPWithStaticEgress,omitempty" yaml:"disablePublicIPWithStaticEgress,omitempty"`
+
 	AwsRoles          []string          `json:"awsRoles" yaml:"awsRoles"`
 	LambdaSchedule    *LambdaSchedule   `json:"lambdaSchedule,omitempty" yaml:"lambdaSchedule,omitempty"`   // e.g. for lambda functions to be triggered on schedule
 	LambdaSchedules   []LambdaSchedule  `json:"lambdaSchedules,omitempty" yaml:"lambdaSchedules,omitempty"` // e.g. for lambda functions to be triggered on schedule

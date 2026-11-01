@@ -105,3 +105,61 @@ resource (S3 bucket, RDS instance, ECR repo, Lambda, ECS service,
 CloudTrail trail, …). The migration from in-tree to plugin preserves
 every URN. See
 [`04-no-destroy-invariant.md`](https://github.com/simple-container-com/forge/blob/main/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md).
+
+## Optional ECS hardening (S-03, S-12, S-13)
+
+All flags below default to `false`. An unchanged existing stack keeps the
+`origin/main` resources and properties: the shared execution/task role and its
+permissions, security group rules and attachments, HTTP listener, public-IP
+setting, and NLB without security groups. A domain alone does not enable TLS,
+so existing Cloudflare Flexible SSL configurations continue using HTTP.
+
+These opt-ins are **recommended for new stacks**. Enabling them on an existing
+stack is an explicit migration; review its resource and permission changes first.
+Set them in the consuming stack's `cloudExtras`:
+
+```yaml
+domain: app.example.com
+cloudExtras:
+  leastPrivilegeRoles: true
+  restrictTaskIngress: true
+  enableHTTPS: true
+  disablePublicIPWithStaticEgress: true
+  # For NEW NLB stacks only (omit for ALBs and existing NLBs):
+  # nlbSecurityGroups: true
+```
+
+| Flag | Opt-in behavior |
+| --- | --- |
+| `leastPrivilegeRoles` | Creates a separate `<cluster>-task-role`. The existing execution role gets image-pull/logging permissions and access to this stack's secret ARNs. The runtime role gets ECS Exec channels, mounted EFS filesystem access, and explicit `awsRoles` actions. Both honor `permissionsBoundary`. |
+| `restrictTaskIngress` | Limits tasks to the ingress container and health-check ports from the load balancer group; moves the ALB to `-lb-sg` and EFS mount targets to `-efs-sg`, allowing NFS from tasks only. |
+| `nlbSecurityGroups` | Attaches `-lb-sg` to an NLB. AWS replaces an existing NLB created without security groups when this is enabled; target groups, listeners and DNS may also change. Use for new NLB stacks. |
+| `enableHTTPS` | For an ALB with a domain, requests and validates ACM, adds HTTPS on 443 and redirects HTTP on 80 to HTTPS. The single AWSX HTTP listener retains its `<load-balancer-name>-0` identity. NLB behavior is unchanged. |
+| `disablePublicIPWithStaticEgress` | Sets `assignPublicIp: false` only when `staticEgressIP: true` supplies private subnets and NAT. Otherwise public IPs stay enabled, including existing static-egress stacks without this flag. |
+
+With `leastPrivilegeRoles`, workloads requiring runtime Secrets Manager, ECR,
+CloudWatch, logs or SSM APIs must explicitly request those actions through
+`cloudExtras.awsRoles`. Enabling the flag on an existing shared-role stack can
+narrow permissions before its tasks finish rolling; plan that migration. With
+the flag omitted, the original broad policy is retained throughout deployment.
+
+With `restrictTaskIngress`, `cloudExtras.securityGroup.ingress` restricts the
+load balancer listeners. Explicit address-family lists close the other family
+unless listed; empty lists deny ingress. `allowOnlyCloudflare` resolves published
+Cloudflare ranges during provisioning. An NLB without `nlbSecurityGroups` keeps
+its existing attachment behavior; restricted tasks trust NLB subnet CIDRs on
+app/health ports (client IP preservation must remain disabled). Frontend CIDR
+and Cloudflare allowlists cannot filter NLB clients in this combination because
+the NLB has no group; use `nlbSecurityGroups` on a new NLB to enforce them.
+Hosts in those subnets can also reach those ports. Without `restrictTaskIngress`, the original
+custom security group processing and shared ALB/task/EFS group remain intact.
+
+With `enableHTTPS`, the registrar must control the domain and support CNAME
+records. The validation CNAME is DNS-only; keep it for renewal. The current
+registrar interface requires a resolved string record name/type, so ACM's
+validation record is created in `ApplyT`; registering it before that requires a
+core registrar API change. The validation waiter depends on its returned output.
+The HTTP redirect preserves host, path and query and TLS uses
+`ELBSecurityPolicy-TLS13-1-2-2021-06`. Cloudflare must use **Full (strict)** when
+enabling this flag; Flexible SSL would redirect in a loop. When omitted, no ACM
+resources, validation records, HTTPS listener or redirect are introduced.
