@@ -419,6 +419,26 @@ func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeP
 		return nil, err
 	}
 
+	// Use the PARENT's env (ParentInfo.ParentEnv) rather than the client's
+	// own env for the StackParams here. Compute processors read their
+	// parent's exports from the parent stack root, and those export keys
+	// use the parent's env suffix — `forge-storage--staging-bucket-name`,
+	// not `forge-storage--<client-env>-bucket-name`.
+	// `input.ToResName` (api/pkg/api/server.go:147) prefers
+	// StackParams.ParentEnv over StackParams.Environment, so pre-swapping
+	// it here lets the compute processor's own code remain
+	// env-agnostic.
+	//
+	// Live-caught 2026-11-01 on forge-storage isolated deploy
+	// run 41290064279: client env `108b3f` built key
+	// `forge-storage--108b3f-bucket-name` which did not exist in the
+	// parent (parent exports under `--staging`). sc-plugin-mongodb has
+	// the equivalent swap in resourceInputFromComputeProcess; this is
+	// the aws port of the same pattern.
+	env := req.GetHeader().GetEnvironment()
+	if parent != nil && parent.ParentEnv != "" {
+		env = parent.ParentEnv
+	}
 	input := api.ResourceInput{
 		Descriptor: &api.ResourceDescriptor{
 			Type:   req.GetResourceType(),
@@ -427,7 +447,7 @@ func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeP
 		},
 		StackParams: &api.StackParams{
 			StackName:   req.GetHeader().GetStackName(),
-			Environment: req.GetHeader().GetEnvironment(),
+			Environment: env,
 		},
 	}
 
