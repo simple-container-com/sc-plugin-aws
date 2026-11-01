@@ -93,6 +93,9 @@ func EcsFargate(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, para
 	if !ok {
 		return output, errors.Errorf("failed to convert ecs_fargate config for %q in stack %q in %q", input.Descriptor.Type, stack.Name, deployParams.Environment)
 	}
+	if err := validateEcsContainerSecrets(crInput, params.ComputeContext); err != nil {
+		return output, err
+	}
 	if lo.FromPtr(crInput.CloudExtras).EnableHTTPS && crInput.Domain != "" {
 		if params.Registrar == nil {
 			return nil, errors.New("a DNS registrar is required for an ECS domain")
@@ -144,6 +147,9 @@ func EcsFargate(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, para
 }
 
 func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.ProvisionParams, deployParams api.StackParams, crInput *aws.EcsFargateInput, ref *EcsFargateOutput) error {
+	if err := validateEcsContainerSecrets(crInput, params.ComputeContext); err != nil {
+		return err
+	}
 	opts := []sdk.ResourceOption{
 		sdk.Provider(params.Provider),
 		sdk.DependsOn(params.ComputeContext.Dependencies()),
@@ -468,7 +474,11 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 				Value: sdk.StringPtr(deployParams.Version),
 			})
 			secretsVariables := ecs.TaskDefinitionSecretArray{}
-			secretsVariables = append(secretsVariables, lo.Map(secrets, func(item *CreatedSecret, _ int) ecs.TaskDefinitionSecretInput {
+			allowedSecrets, scoped := hardening.ContainerSecrets[image.Container.Name]
+			containerSecrets := lo.Filter(secrets, func(secret *CreatedSecret, _ int) bool {
+				return !scoped || lo.Contains(allowedSecrets, secret.EnvVar)
+			})
+			secretsVariables = append(secretsVariables, lo.Map(containerSecrets, func(item *CreatedSecret, _ int) ecs.TaskDefinitionSecretInput {
 				return ecs.TaskDefinitionSecretArgs{
 					Name:      sdk.String(item.EnvVar),
 					ValueFrom: item.Secret.Arn,

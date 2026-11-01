@@ -98,6 +98,35 @@ func TestDecodeTypedConfig_EcsCloudExtrasSources(t *testing.T) {
 	})
 }
 
+func TestDecodeTypedConfig_EcsContainerSecrets(t *testing.T) {
+	// Old core's typed CloudExtras drops this new field; PR #5's raw
+	// stackConfig transport must preserve empty lists (gateway gets none).
+	for _, rawOnly := range []bool{false, true} {
+		t.Run(map[bool]string{false: "typed", true: "old core raw extras"}[rawOnly], func(t *testing.T) {
+			extras := map[string]any{"containerSecrets": map[string]any{
+				"gateway": []any{}, "identity": []any{"SIGNING_KEY_PEM", "MONGO_URI"},
+			}}
+			cfg := map[string]any{"cloudExtras": extras}
+			if rawOnly {
+				cfg = map[string]any{"cloudExtras": map[string]any{}, "stackConfig": map[string]any{"cloudExtras": extras}}
+			}
+			decoded, err := decodeTypedConfig(awsApi.TemplateTypeEcsFargate, requestInputs(t, cfg))
+			require.NoError(t, err)
+			b, err := json.Marshal(decoded.(*awsApi.EcsFargateInput).CloudExtras)
+			require.NoError(t, err)
+			var got map[string]any
+			require.NoError(t, json.Unmarshal(b, &got))
+			require.Equal(t, extras["containerSecrets"], got["containerSecrets"])
+		})
+	}
+	t.Run("malformed list is rejected", func(t *testing.T) {
+		_, err := decodeTypedConfig(awsApi.TemplateTypeEcsFargate, requestInputs(t, map[string]any{
+			"stackConfig": map[string]any{"cloudExtras": map[string]any{"containerSecrets": map[string]any{"identity": "SIGNING_KEY_PEM"}}},
+		}))
+		require.ErrorContains(t, err, "stackConfig.cloudExtras")
+	})
+}
+
 // Match core's JSON -> InputValue serialization, including nested maps/lists.
 // No plugin process, Pulumi engine, credentials or network access is needed.
 func requestInputs(t *testing.T, cfg any) map[string]*scpluginv1.InputValue {

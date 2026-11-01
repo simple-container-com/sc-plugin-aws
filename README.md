@@ -163,3 +163,63 @@ The HTTP redirect preserves host, path and query and TLS uses
 `ELBSecurityPolicy-TLS13-1-2-2021-06`. Cloudflare must use **Full (strict)** when
 enabling this flag; Flexible SSL would redirect in a loop. When omitted, no ACM
 resources, validation records, HTTPS listener or redirect are introduced.
+
+## Per-container ECS secrets
+
+For `ecs-fargate` cloud-compose stacks, set `config.cloudExtras.containerSecrets`
+in the consuming stack's `client.yaml`. Keys are compose service names from
+`config.runs`; values are allowlists of **secret environment variable names**:
+
+```yaml
+config:
+  runs: [gateway, identity, profiles]
+  cloudExtras:
+    containerSecrets:
+      gateway: []
+      identity: [MONGO_URI, SIGNING_KEY_PEM, MAIL_URL]
+      profiles: [MONGO_URI, PROFILES_SERVICE_KEY]
+  secrets:
+    MONGO_URI: ${resource:mongodb.uri}
+    SIGNING_KEY_PEM: ${secret:signing-key}
+    MAIL_URL: ${secret:mail-url}
+    PROFILES_SERVICE_KEY: ${secret:profiles-service-key}
+```
+
+An omitted `containerSecrets` block or an empty map keeps existing behavior.
+When the map is configured, an omitted service entry receives every available
+stack and resource/context secret. A present service entry restricts injection to its
+listed names; `[]` injects none. List every service, including the
+gateway, to scope the whole task. Duplicate names do not duplicate injection.
+Use an explicit `[]` for an empty list: SC's RPC transport omits YAML `null`
+map entries, which would leave the service with the legacy default.
+
+Names can refer to `config.secrets` or secret env variables supplied by compute
+resources (for example a resource's `MONGO_URI`). Unknown containers are rejected
+during conversion and checked again by the plugin for older cores. Unknown secret
+names, including ordinary env names, are rejected before the cluster creates
+resources, once resource/context env variables are available. Errors identify
+names without revealing secret values.
+
+Each secret is still created once in Secrets Manager, with the existing names,
+values, stack-over-context precedence, and ECS `valueFrom` ARN references. The
+allowlist filters ECS secret injection only. Plain compose, stack and context env
+keep their existing behavior, and a secret excluded from a container cannot fall
+back to that container's compose/stack env entry of the same name. Keep secret
+values in `config.secrets` or resource outputs; this does not add SC
+`${secret:...}` interpolation to compose `environment` or compose file mounts.
+
+This uses the raw `stackConfig.cloudExtras` transport restored in PR #5, so a
+core whose linked AWS converter predates `containerSecrets` can still pass the
+setting to an updated plugin. No compose edit is required. The existing
+`EcsFargateContainer.Secrets` value map is not repurposed as an allowlist.
+For a nonempty `containerSecrets` map, the plugin also reads secret compute env
+variables from core's provisioning request. The legacy plugin ignored that
+request context; stacks without allowlists and ordinary context env retain
+their previous behavior. Resource-only names require a core that sends
+`ProvisionRequest.compute_env_vars` (as the current core does).
+
+Containers in one task still share its network namespace and task IAM role.
+This setting limits injected process environments; it does not create separate
+IAM identities. With the legacy shared execution/task role, workloads can still
+read task secrets through AWS APIs. Combine with `leastPrivilegeRoles` and avoid
+granting the runtime role secret-read actions when that access is unnecessary.
