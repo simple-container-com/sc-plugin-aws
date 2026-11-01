@@ -7,30 +7,50 @@ import (
 	"sync"
 
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
-	awsApi "github.com/simple-container-com/sc-plugin-aws/api"
 )
 
-// capturingCollector implements pApi.ComputeContextCollector in-plugin
-// and records what the lifted RdsPostgres/RdsMysql/S3Bucket
-// ComputeProcessors mutate, so the plugin can translate those mutations
-// into a Phase 1e v2 ComputeProcessResponse.
+// capturingCollector implements pApi.ComputeContextCollector in-plugin with
+// TWO distinct pools that must not be confused:
 //
-// What crosses the bus (and thus is captured here): AddEnvVariableIfNotExist,
-// AddSecretEnvVariableIfNotExist, AddResourceTplExtension,
-// AddDependencyTplExtension. These map 1:1 to the response's EnvVars
-// + TplExtensions fields.
+//   - incomingEnvVars / incomingSecrets: the env vars the CONSUMER stack's
+//     `uses:` resources contributed, delivered to this plugin's Provision
+//     RPC via ProvisionRequest.compute_env_vars. The aws Lambda / ECS /
+//     static-site drivers read these via EnvVariables() and
+//     SecretEnvVariables() to inject them into their deployed containers
+//     and function envs. Populated by newProvisionCollector; empty for
+//     plain-resource Provision (s3-bucket, ecr-repository, etc.).
 //
-// What does NOT cross and stays as a no-op: AddDependency(sdk.Resource),
-// AddOutput(sdk.Output), AddPreProcessor, AddPostProcessor,
-// ResolvePlaceholders, Run*Processors. These carry Pulumi handles or Go
-// closures — see pkg/plugin/compute.go doc for the general rule.
+//   - outgoingEnvVars: what THIS plugin's compute processors
+//     (RdsPostgres/RdsMysql/S3Bucket) added via AddEnvVariableIfNotExist /
+//     AddSecretEnvVariableIfNotExist during a ComputeProcess RPC — the
+//     mutations ToResponse() shapes into a ComputeProcessResponse the
+//     plugin bus carries back to SC core, which then re-emits them on the
+//     deploying stack's own compute context.
+//
+// Live-caught 2026-11-01 on forge-notifier staging deploy run 41336224941:
+// the two pools used to be a SINGLE `envVars` plus an ECS-only
+// `inputSecrets` with no non-secret incoming channel, and EnvVariables()
+// returned nil ALWAYS. Lambda templates reading
+// `params.ComputeContext.EnvVariables()` to pick up MONGO_USER /
+// MONGO_PASSWORD from a parent mongodb cluster found nothing, so the
+// Lambda env never gained those vars, the orphan SecretsManager secret
+// got deleted, and the service went dark. See
+// forge/docs/design/2026-11-01/plugin-extraction-playbook/ trap 14.
 type capturingCollector struct {
-	mu            sync.Mutex
-	envVars       []pApi.ComputeEnvVariable
-	inputSecrets  []pApi.ComputeEnvVariable
+	mu sync.Mutex
+
+	// Incoming (from ProvisionRequest.compute_env_vars) — what the Lambda
+	// / ECS / static-site driver reads to populate its deployed env.
+	incomingEnvVars []pApi.ComputeEnvVariable
+	incomingSecrets []pApi.ComputeEnvVariable
+
+	// Outgoing (AddEnvVariableIfNotExist / AddSecretEnvVariableIfNotExist
+	// mutations from THIS plugin's compute processors) — what
+	// ToResponse() shapes into a ComputeProcessResponse.
+	outgoingEnvVars []pApi.ComputeEnvVariable
+
 	resourceTpl   []resourceTplEntry
 	dependencyTpl []dependencyTplEntry
 }
@@ -50,33 +70,67 @@ func newCapturingCollector() *capturingCollector {
 	return &capturingCollector{}
 }
 
-// Only scoped ECS stacks consume incoming context secrets. The legacy plugin
-// ignored ComputeEnvVars; keep unconfigured stacks and ordinary env unchanged.
-// Incoming values stay separate from outgoing compute-process mutations.
-func newProvisionCollector(req *scpluginv1.ProvisionRequest, cfg any) *capturingCollector {
+// newProvisionCollector seeds the INCOMING pool from the ProvisionRequest's
+// compute_env_vars so the Lambda / ECS / static-site driver's reads via
+// EnvVariables() + SecretEnvVariables() return what the consumer stack's
+// `uses:` resources contributed (MONGO_URI, MONGO_USER, MONGO_PASSWORD,
+// bucket env, etc.).
+//
+// Unconditional for every cfg type: pre-fix this was gated on
+// EcsFargateInput + ContainerSecrets, which silently dropped incoming
+// env vars for aws-lambda, aws-static-website, and ECS stacks without
+// container-secret declarations. Live-caught 2026-11-01 on forge-notifier
+// — see the type-level doc.
+func newProvisionCollector(req *scpluginv1.ProvisionRequest, _ any) *capturingCollector {
 	c := newCapturingCollector()
-	ecs, ok := cfg.(*awsApi.EcsFargateInput)
-	if !ok || ecs.CloudExtras == nil || len(ecs.CloudExtras.ContainerSecrets) == 0 {
-		return c
-	}
 	for _, v := range req.GetComputeEnvVars() {
+		// Defensive: a nil entry or one with no name is a wire artefact
+		// (unset proto field, protobuf's nil-safe getters would otherwise
+		// synthesise an empty env var in the pool).
+		if v == nil || v.GetName() == "" {
+			continue
+		}
+		entry := pApi.ComputeEnvVariable{
+			Name:         v.GetName(),
+			Value:        v.GetValue(),
+			Secret:       v.GetSecret(),
+			ResourceName: v.GetResourceName(),
+			ResourceType: v.GetResourceType(),
+			StackName:    v.GetStackName(),
+		}
 		if v.GetSecret() {
-			c.inputSecrets = append(c.inputSecrets, pApi.ComputeEnvVariable{
-				Name: v.GetName(), Value: v.GetValue(), Secret: true,
-				ResourceName: v.GetResourceName(), ResourceType: v.GetResourceType(), StackName: v.GetStackName(),
-			})
+			c.incomingSecrets = append(c.incomingSecrets, entry)
+		} else {
+			c.incomingEnvVars = append(c.incomingEnvVars, entry)
 		}
 	}
 	return c
 }
 
-func (c *capturingCollector) SecretEnvVariables() []pApi.ComputeEnvVariable { return c.inputSecrets }
-func (c *capturingCollector) EnvVariables() []pApi.ComputeEnvVariable       { return nil }
+// EnvVariables returns the incoming (non-secret) compute env vars the
+// deploying stack's `uses:` resources contributed. Lambda / ECS /
+// static-site drivers read these to inject into the deployed container's
+// environment.
+func (c *capturingCollector) EnvVariables() []pApi.ComputeEnvVariable {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]pApi.ComputeEnvVariable(nil), c.incomingEnvVars...)
+}
+
+// SecretEnvVariables returns the incoming SECRET compute env vars. Same
+// reader shape as EnvVariables(); the Secret flag is what drives the
+// Lambda template to resolve the value via SecretsManager instead of
+// baking it into the env directly.
+func (c *capturingCollector) SecretEnvVariables() []pApi.ComputeEnvVariable {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]pApi.ComputeEnvVariable(nil), c.incomingSecrets...)
+}
 
 func (c *capturingCollector) AddEnvVariableIfNotExist(name, value, resType, resName, stackName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.envVars = append(c.envVars, pApi.ComputeEnvVariable{
+	c.outgoingEnvVars = append(c.outgoingEnvVars, pApi.ComputeEnvVariable{
 		Name: name, Value: value, ResourceType: resType, ResourceName: resName, StackName: stackName, Secret: false,
 	})
 }
@@ -84,7 +138,7 @@ func (c *capturingCollector) AddEnvVariableIfNotExist(name, value, resType, resN
 func (c *capturingCollector) AddSecretEnvVariableIfNotExist(name, value, resType, resName, stackName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.envVars = append(c.envVars, pApi.ComputeEnvVariable{
+	c.outgoingEnvVars = append(c.outgoingEnvVars, pApi.ComputeEnvVariable{
 		Name: name, Value: value, ResourceType: resType, ResourceName: resName, StackName: stackName, Secret: true,
 	})
 }
@@ -115,11 +169,15 @@ func (c *capturingCollector) RunPreProcessors(any, any) error                   
 func (c *capturingCollector) RunPostProcessors(any, any) error                   { return nil }
 func (c *capturingCollector) ResourceOutputs() pApi.ResourcesOutputs             { return nil }
 
+// ToResponse packages the OUTGOING mutations (what THIS plugin's compute
+// processors added) into a ComputeProcessResponse for the plugin bus.
+// Does NOT echo back the incoming pool — those are context for THIS
+// Provision, not something to re-send to SC core.
 func (c *capturingCollector) ToResponse() *scpluginv1.ComputeProcessResponse {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	resp := &scpluginv1.ComputeProcessResponse{}
-	for _, v := range c.envVars {
+	for _, v := range c.outgoingEnvVars {
 		resp.EnvVars = append(resp.EnvVars, &scpluginv1.ComputeEnvVariable{
 			Name:         v.Name,
 			Value:        v.Value,
