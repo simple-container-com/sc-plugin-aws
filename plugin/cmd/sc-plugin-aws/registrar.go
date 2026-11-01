@@ -4,6 +4,7 @@
 package main
 
 import (
+	"fmt"
 	"runtime/debug"
 
 	"github.com/pkg/errors"
@@ -127,7 +128,11 @@ func (r *scCoreRegistrar) NewRecord(ctx *sdk.Context, record api.DnsRecord) (*ap
 			return "", errors.Wrapf(err, "scCoreRegistrar.NewRecord via PeerInvoke to %q", r.pluginName)
 		}
 		return resp.GetUrn(), nil
-	})
+	}).(sdk.StringOutput)
+	// See ProvisionDomainForEndpoint — the discarded-caller trap applies
+	// here too. Callers that don't retain the ResourceOutput must still
+	// have the ApplyT fire; ctx.Export is the forcing function.
+	ctx.Export(fmt.Sprintf("%s-registrar-record-urn", record.Name), urnOut)
 	return &api.ResourceOutput{Ref: urnOut}, nil
 }
 
@@ -165,7 +170,10 @@ func (r *scCoreRegistrar) NewOverrideHeaderRule(ctx *sdk.Context, stack api.Stac
 			return "", errors.Wrapf(err, "scCoreRegistrar.NewOverrideHeaderRule via PeerInvoke to %q", r.pluginName)
 		}
 		return resp.GetUrn(), nil
-	})
+	}).(sdk.StringOutput)
+	// See ProvisionDomainForEndpoint — the discarded-caller trap applies
+	// here too.
+	ctx.Export(fmt.Sprintf("%s-%s-registrar-override-urn", stack.Name, rule.Name), urnOut)
 	return &api.ResourceOutput{Ref: urnOut}, nil
 }
 
@@ -190,7 +198,22 @@ func (r *scCoreRegistrar) ProvisionDomainForEndpoint(ctx *sdk.Context, stack api
 			return "", errors.Wrapf(err, "scCoreRegistrar.ProvisionDomainForEndpoint via PeerInvoke to %q", r.pluginName)
 		}
 		return resp.GetUrn(), nil
-	})
+	}).(sdk.StringOutput)
+	// Force the ApplyT chain to actually fire by exporting it. Without this
+	// export, callers that discard the returned ResourceOutput (which the
+	// aws Lambda / ECS / static-site templates do — they only check the
+	// synchronous err) leave the ApplyT closure with no downstream consumer,
+	// and Pulumi's SDK drops it. The PeerInvoke RPC that registers the
+	// cloudflare record then never fires, and the deploy reads green with
+	// no DNS record created.
+	// Live-caught 2026-11-01 on forge-notifier staging deploy run
+	// 41339900839: Lambda env gained MONGO_USER/MONGO_PASSWORD correctly
+	// (incoming compute-env-var pool fix in aws#8) but the CNAME +
+	// workerScript never re-created despite stackConfig.Domain set and
+	// params.Registrar non-nil.
+	// Export key is unique per (stack, endpoint) so a stack with multiple
+	// domains doesn't collide.
+	ctx.Export(fmt.Sprintf("%s-%s-registrar-domain-urn", stack.Name, endpoint.Name), urnOut)
 	return &api.ResourceOutput{Ref: urnOut}, nil
 }
 
