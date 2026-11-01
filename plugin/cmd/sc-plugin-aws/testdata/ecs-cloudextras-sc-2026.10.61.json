@@ -1,0 +1,131 @@
+{
+  "templateConfig": {
+    "account": "",
+    "accessKey": "",
+    "secretAccessKey": "",
+    "region": "",
+    "credentials": ""
+  },
+  "scale": {
+    "min": 1,
+    "max": 2,
+    "policy": null,
+    "update": {
+      "minHealthyPercent": 100,
+      "maxPercent": 200
+    }
+  },
+  "containers": null,
+  "ingressContainer": {
+    "name": "",
+    "image": {
+      "name": "",
+      "dockerfile": "",
+      "context": "",
+      "build": null,
+      "platform": ""
+    },
+    "env": null,
+    "secrets": null,
+    "port": 0,
+    "livenessProbe": {
+      "command": null,
+      "httpGet": {
+        "path": "",
+        "port": 0,
+        "successCodes": "",
+        "healthyThreshold": 0
+      },
+      "initialDelaySeconds": 0,
+      "timeoutSeconds": 0,
+      "intervalSeconds": 0,
+      "retries": 0
+    },
+    "startupProbe": {
+      "command": null,
+      "httpGet": {
+        "path": "",
+        "port": 0,
+        "successCodes": "",
+        "healthyThreshold": 0
+      },
+      "initialDelaySeconds": 0,
+      "timeoutSeconds": 0,
+      "intervalSeconds": 0,
+      "retries": 0
+    },
+    "mountPoints": null,
+    "cpu": 0,
+    "memory": 0,
+    "dependsOn": null
+  },
+  "config": {
+    "credentials": "",
+    "account": "",
+    "accessKey": "",
+    "secretAccessKey": "",
+    "region": "",
+    "cpu": 1024,
+    "memory": 2048,
+    "ephemeralStorageGB": 0,
+    "version": ""
+  },
+  "domain": "staging-app-innmind.alphamind.co",
+  "domainProxied": null,
+  "refResourceNames": [
+    "mongodb"
+  ],
+  "secrets": null,
+  "baseDnsZone": "",
+  "dependencies": null,
+  "volumes": [],
+  "alerts": null,
+  "composeDir": "/offline",
+  "cloudExtras": {
+    "awsRoles": null,
+    "lambdaRoutingType": "",
+    "lambdaInvokeMode": "",
+    "securityGroup": {
+      "ingress": {
+        "allowOnlyCloudflare": true
+      }
+    }
+  },
+  "stackConfig": {
+    "dockerComposeFile": "...",
+    "domain": "staging-app-innmind.alphamind.co",
+    "prefix": "",
+    "proxyKeepPrefix": false,
+    "domainProxied": null,
+    "baseDnsZone": "",
+    "uses": [
+      "mongodb"
+    ],
+    "runs": null,
+    "env": null,
+    "secrets": null,
+    "version": "",
+    "size": {
+      "name": "",
+      "cpu": "1024",
+      "memory": "2048",
+      "ephemeral": ""
+    },
+    "textVolumes": null,
+    "headers": null,
+    "lbConfig": null,
+    "cloudExtras": {
+      "enableHTTPS": true,
+      "leastPrivilegeRoles": true,
+      "restrictTaskIngress": true,
+      "securityGroup": {
+        "ingress": {
+          "allowOnlyCloudflare": true
+        }
+      }
+    },
+    "staticEgressIP": null,
+    "imagePullPolicy": null,
+    "clusterIPAddress": null
+  }
+}
