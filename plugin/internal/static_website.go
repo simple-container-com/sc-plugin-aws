@@ -13,15 +13,14 @@ import (
 
 	"github.com/MShekow/directory-checksum/directory_checksum"
 	"github.com/pkg/errors"
-	"github.com/spf13/afero"
-
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/s3"
 	"github.com/pulumi/pulumi-command/sdk/go/command/local"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
+	"github.com/spf13/afero"
+
 	"github.com/simple-container-com/sc-plugin-aws/api"
 )
 
@@ -43,16 +42,19 @@ func StaticWebsite(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, p
 	if input.StackParams != nil {
 		tags = pApi.BuildTagsFromStackParams(*input.StackParams).ToAWSTags()
 	}
+	// Trap-6 workaround: read via the EffectiveX accessors so the
+	// top-level mirrors populated by ToStaticSiteConfig win over the
+	// Site subtree (which SC-core JSON-marshal drops on the plugin bus).
 	ref, err := provisionStaticSite(&StaticSiteInput{
 		ServiceName:        stack.Name,
 		Provider:           params.Provider,
 		Registrar:          params.Registrar,
 		Ctx:                ctx,
 		BundleDir:          bundleDir,
-		IndexDocument:      cfg.Site.IndexDocument,
-		ErrorDocument:      cfg.Site.ErrorDocument,
-		Domain:             cfg.Site.Domain,
-		ProvisionWwwDomain: cfg.Site.ProvisionWwwDomain,
+		IndexDocument:      cfg.EffectiveIndexDocument(),
+		ErrorDocument:      cfg.EffectiveErrorDocument(),
+		Domain:             cfg.EffectiveDomain(),
+		ProvisionWwwDomain: cfg.EffectiveProvisionWwwDomain(),
 		Account:            cfg.AccountConfig,
 		Log:                params.Log,
 		Tags:               tags,
