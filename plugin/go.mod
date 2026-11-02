@@ -23,7 +23,7 @@ require (
 	github.com/pulumi/pulumi-random/sdk/v4 v4.21.0
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
 	github.com/samber/lo v1.53.0
-	github.com/simple-container-com/api v0.0.0-20261102104601-6cb66e285422
+	github.com/simple-container-com/api v0.0.0-20261102142605-7a84b47744bf
 	github.com/simple-container-com/sc-plugin-aws/api v0.0.0
 	github.com/spf13/afero v1.15.0
 	github.com/spf13/cobra v1.10.2

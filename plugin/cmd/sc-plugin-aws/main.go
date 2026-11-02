@@ -42,6 +42,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -55,6 +56,7 @@ import (
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
+	"github.com/simple-container-com/api/pkg/clouds/compose"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
@@ -447,6 +449,110 @@ func (p *awsPlugin) InitSecretsProvider(_ context.Context, req *scpluginv1.InitS
 	}
 	p.progress.Info("secrets-provider", fmt.Sprintf("configuring aws-kms (key=%q)", cfg.KeyName))
 	return &scpluginv1.InitSecretsProviderResponse{ProviderUrl: cfg.KeyUrl()}, nil
+}
+
+// ConvertStackConfig is the plugin-side half of SC core's A2 path
+// (plugin-types-parse-time-registration). SC core calls this once per
+// deploy per client stack whose template type is plugin-owned
+// (api.IsPluginOwnedType returns a binding for awsApi.TemplateType* —
+// aws-lambda, ecs-fargate, aws-static-website). The handler decodes
+// the parent-side TEMPLATE config + the client-side StackConfig*
+// into the typed shapes the existing ToXxxConfig closures expect,
+// runs the right closure, and marshals the typed Input back as an
+// InputValue tree. The three structured fields SC core wraps in
+// pluginPreparedInput (base_dns_zone, uses, depends_on_resources)
+// come from the typed Input's DnsConfigAware/ResourceAware/
+// WithDependsOnResources interface methods, which every aws Input
+// already implements.
+//
+// This handler is the ONLY plugin-side change the A2 migration
+// requires — the ToXxxConfig closures stay unchanged, their /api
+// registrations stay for operators using older SC CLI versions, and
+// the plugin's existing Provision RPC continues to accept the same
+// typed Input shape it does today. Blast radius: additive.
+func (p *awsPlugin) ConvertStackConfig(ctx context.Context, req *scpluginv1.ConvertStackConfigRequest) (*scpluginv1.ConvertStackConfigResponse, error) {
+	templateType := req.GetTemplateType()
+	stackName := req.GetStackName()
+	stackDir := req.GetStackDir()
+	p.progress.Info("convert-stack-config", fmt.Sprintf("template=%q stack=%q", templateType, stackName))
+
+	// Template config — the plugin's typed TemplateConfig, decoded from
+	// the opaque map the pre-A2 providerConfigMapping used to decode on
+	// SC core's side.
+	templatePlain := scPlugin.InputsToPlain(req.GetTemplateConfig())
+	tplCfg := &awsApi.TemplateConfig{}
+	if err := yamlRoundTrip(templatePlain, tplCfg); err != nil {
+		return nil, errors.Wrapf(err, "decode template_config for %q", templateType)
+	}
+
+	// Dispatch by template type — one branch per registered converter.
+	stackPlain := scPlugin.InputsToPlain(req.GetStackConfig())
+	var typedInput any
+	var err error
+	switch templateType {
+	case awsApi.TemplateTypeAwsLambda:
+		stackCfg := &api.StackConfigSingleImage{}
+		if err := yamlRoundTrip(stackPlain, stackCfg); err != nil {
+			return nil, errors.Wrap(err, "decode StackConfigSingleImage")
+		}
+		typedInput, err = awsApi.ToAwsLambdaConfig(tplCfg, stackCfg)
+	case awsApi.TemplateTypeEcsFargate:
+		stackCfg := &api.StackConfigCompose{}
+		if err := yamlRoundTrip(stackPlain, stackCfg); err != nil {
+			return nil, errors.Wrap(err, "decode StackConfigCompose")
+		}
+		composeCfg, cerr := compose.ReadDockerCompose(ctx, stackDir, stackCfg.DockerComposeFile)
+		if cerr != nil {
+			return nil, errors.Wrapf(cerr, "read docker-compose from %q/%q", stackDir, stackCfg.DockerComposeFile)
+		}
+		typedInput, err = awsApi.ToEcsFargateConfig(tplCfg, composeCfg, stackCfg)
+	case awsApi.TemplateTypeStaticWebsite:
+		stackCfg := &api.StackConfigStatic{}
+		if err := yamlRoundTrip(stackPlain, stackCfg); err != nil {
+			return nil, errors.Wrap(err, "decode StackConfigStatic")
+		}
+		typedInput, err = awsApi.ToStaticSiteConfig(tplCfg, stackDir, stackName, stackCfg)
+	default:
+		return nil, errors.Errorf("sc-plugin-aws does not own template type %q", templateType)
+	}
+	if err != nil {
+		return nil, errors.Wrapf(err, "convert %q for stack %q", templateType, stackName)
+	}
+
+	resp := &scpluginv1.ConvertStackConfigResponse{
+		Input: scPlugin.PlainToInputs(typedInput),
+	}
+	// Lift the three structured fields SC core type-asserts off downstream
+	// into the response. Every aws Input implements all three (see
+	// api/aws_lambda.go, api/ecs_fargate.go, api/static_website.go).
+	if dca, ok := typedInput.(api.DnsConfigAware); ok {
+		resp.BaseDnsZone = dca.OverriddenBaseZone()
+	}
+	if ra, ok := typedInput.(api.ResourceAware); ok {
+		resp.Uses = ra.Uses()
+	}
+	if wdr, ok := typedInput.(api.WithDependsOnResources); ok {
+		for _, dep := range wdr.DependsOnResources() {
+			raw, jerr := json.Marshal(dep)
+			if jerr != nil {
+				return nil, errors.Wrap(jerr, "marshal depends-on entry")
+			}
+			resp.DependsOnResourcesJson = append(resp.DependsOnResourcesJson, raw)
+		}
+	}
+	return resp, nil
+}
+
+// yamlRoundTrip decodes a plain map[string]any (what InputsToPlain
+// returns from the bus's InputValue tree) into a typed struct via a
+// YAML round-trip. Same shape pApi.ConvertConfig uses, lifted locally
+// so this handler does not reach into pkg/api private helpers.
+func yamlRoundTrip(src any, out any) error {
+	b, err := yaml.Marshal(src)
+	if err != nil {
+		return err
+	}
+	return yaml.Unmarshal(b, out)
 }
 
 func (p *awsPlugin) PreDestroy(_ context.Context, req *scpluginv1.PreDestroyRequest) (*scpluginv1.PreDestroyResponse, error) {
