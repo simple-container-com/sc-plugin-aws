@@ -161,7 +161,7 @@ func (p *awsPlugin) Provider(ctx context.Context, req *scpluginv1.ProviderReques
 			Environment: req.GetHeader().GetEnvironment(),
 		},
 	}
-	out, err := awsInternal.Provider(rctx.Pulumi, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New(), ComputeContext: newCapturingCollector()})
+	out, err := awsInternal.Provider(rctx.Pulumi, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{Log: logger.New(), ComputeContext: &runtime.Collector{}})
 	if err != nil {
 		p.progress.Error("provider", err.Error())
 		return nil, err
@@ -267,7 +267,7 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 
 	params := pApi.ProvisionParams{
 		Log:              logger.New(),
-		ComputeContext:   newProvisionCollector(req, cfg),
+		ComputeContext:   runtime.NewProvisionCollector(req),
 		Provider:         provider,
 		BaseEnvVariables: map[string]string{},
 	}
@@ -351,17 +351,21 @@ func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeP
 	// 41290064279. Now in the shared runtime library.
 	input := runtime.ResourceInputForComputeProcess(req, parent, cfg)
 
-	collector := newCapturingCollector()
-	_, err = fn(rctx.Pulumi, api.Stack{Name: req.GetHeader().GetStackName()}, input, collector, pApi.ProvisionParams{
+	// Drain-and-marshal is enforced by runtime.RunComputeProcess. The
+	// shared Collector captures ApplyT-wrapped mutations the dispatched
+	// processor runs; the wrapper awaits every captured output BEFORE
+	// marshalling, so the deploy cannot silently emit zero vars when
+	// a processor builds its env from inside an ApplyT. This closes
+	// trap 16 (sc-plugin-aws S3BucketComputeProcessor live-caught on
+	// agent-native-pdf-rendering run f4355798, 2026-11-02).
+	resp, _, err = runtime.RunComputeProcess(ctx, rctx, api.Stack{Name: req.GetHeader().GetStackName()}, input, pApi.ProvisionParams{
 		Log:         logger.New(),
 		ParentStack: parent,
-	})
+	}, runtime.ComputeProcessHandler(fn))
 	if err != nil {
 		p.progress.Error("compute-process", err.Error())
 		return nil, err
 	}
-
-	resp = collector.ToResponse()
 	p.progress.Info("compute-process", fmt.Sprintf("emitted %d env var(s) + %d tpl extension(s)", len(resp.GetEnvVars()), len(resp.GetTplExtensions())))
 	return resp, nil
 }
@@ -498,7 +502,7 @@ func (p *awsPlugin) buildAwsProvider(pctx *sdk.Context, cfg any, stackName, prov
 			Environment: environment,
 		},
 	}
-	out, err := awsInternal.Provider(pctx, api.Stack{Name: stackName}, providerInput, pApi.ProvisionParams{Log: logger.New(), ComputeContext: newCapturingCollector()})
+	out, err := awsInternal.Provider(pctx, api.Stack{Name: stackName}, providerInput, pApi.ProvisionParams{Log: logger.New(), ComputeContext: &runtime.Collector{}})
 	if err != nil {
 		return nil, err
 	}

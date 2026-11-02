@@ -11,6 +11,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/cloudtrail v1.56.4
 	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.75.2
 	github.com/aws/aws-secretsmanager-caching-go/v2 v2.3.0
+	github.com/compose-spec/compose-go v1.20.2
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-plugin v1.6.3
 	github.com/onsi/gomega v1.44.0
@@ -22,7 +23,7 @@ require (
 	github.com/pulumi/pulumi-random/sdk/v4 v4.21.0
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
 	github.com/samber/lo v1.53.0
-	github.com/simple-container-com/api v0.0.0-20261101135901-669578f81d06
+	github.com/simple-container-com/api v0.0.0-20261102104601-6cb66e285422
 	github.com/simple-container-com/sc-plugin-aws/api v0.0.0
 	github.com/spf13/afero v1.15.0
 	github.com/spf13/cobra v1.10.2
@@ -68,7 +69,6 @@ require (
 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
-	github.com/compose-spec/compose-go v1.20.2 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
