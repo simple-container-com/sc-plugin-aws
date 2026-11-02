@@ -8,6 +8,7 @@ import (
 
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+	"github.com/simple-container-com/api/pkg/plugin/runtime"
 	"github.com/stretchr/testify/require"
 
 	awsApi "github.com/simple-container-com/sc-plugin-aws/api"
@@ -31,18 +32,18 @@ func TestProvisionCollectorIncomingEnvVars(t *testing.T) {
 			nil, // defensive: a nil entry must not crash
 		},
 	}
-	// cfg is irrelevant to the pool population — exercise with Lambda, ECS, nil.
-	for _, cfg := range []any{&awsApi.LambdaInput{}, &awsApi.EcsFargateInput{}, nil} {
-		c := newProvisionCollector(req, cfg)
-		require.Equal(t, []pApi.ComputeEnvVariable{
-			{Name: "MONGO_PASSWORD", Value: "pw", Secret: true, ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "infra"},
-		}, c.SecretEnvVariables(), "secret env vars must flow regardless of cfg type")
-		require.Equal(t, []pApi.ComputeEnvVariable{
-			{Name: "MONGO_USER", Value: "user", Secret: false, ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "infra"},
-			{Name: "MONGO_DATABASE", Value: "app", Secret: false, ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "infra"},
-		}, c.EnvVariables(), "plain env vars must flow regardless of cfg type")
-		require.Empty(t, c.ToResponse().GetEnvVars(), "incoming env vars are not outgoing compute mutations")
-	}
+	// Shared runtime.NewProvisionCollector is cfg-agnostic by construction;
+	// a single call exercises the wiring. The pool-split invariant (incoming
+	// does NOT bleed into outgoing / ToResponse) is covered by
+	// api/pkg/plugin/runtime TestNewProvisionCollector_SeedsIncomingPools.
+	c := runtime.NewProvisionCollector(req)
+	require.Equal(t, []pApi.ComputeEnvVariable{
+		{Name: "MONGO_PASSWORD", Value: "pw", Secret: true, ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "infra"},
+	}, c.SecretEnvVariables(), "secret env vars must flow regardless of cfg type")
+	require.Equal(t, []pApi.ComputeEnvVariable{
+		{Name: "MONGO_USER", Value: "user", Secret: false, ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "infra"},
+		{Name: "MONGO_DATABASE", Value: "app", Secret: false, ResourceName: "mongodb", ResourceType: "mongodb-atlas", StackName: "infra"},
+	}, c.EnvVariables(), "plain env vars must flow regardless of cfg type")
 }
 
 // TestProvisionCollectorEcsContainerSecrets locks in the ECS container-secrets
@@ -64,10 +65,9 @@ func TestProvisionCollectorEcsContainerSecrets(t *testing.T) {
 	}
 	cfg, err := decodeTypedConfig(req.GetResourceType(), req.GetInputs())
 	require.NoError(t, err)
-	collector := newProvisionCollector(req, cfg)
+	collector := runtime.NewProvisionCollector(req)
 	require.Equal(t, []pApi.ComputeEnvVariable{
 		{Name: "RESOURCE_PASSWORD", Value: "resource-secret", Secret: true, ResourceName: "db", ResourceType: "mongodb", StackName: "parent"},
 	}, collector.SecretEnvVariables())
 	require.NoError(t, cfg.(*awsApi.EcsFargateInput).ValidateContainerSecrets([]string{collector.SecretEnvVariables()[0].Name}))
-	require.Empty(t, collector.ToResponse().GetEnvVars(), "incoming secrets are not outgoing compute mutations")
 }
