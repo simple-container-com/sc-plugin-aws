@@ -645,8 +645,17 @@ func decodeTypedConfig(resourceType string, inputs map[string]*scpluginv1.InputV
 		// map SC-core sends is the serialised *EcsFargateInput. The
 		// in-tree driver type-asserts `input.Descriptor.Config.Config`
 		// as `*EcsFargateInput`, so decode into that same shape.
+		//
+		// Decode with encoding/json, not yaml: every producer of these
+		// Inputs (SC core's serializeConfigToInputs and this plugin's own
+		// ConvertStackConfig via scPlugin.PlainToInputs) json.Marshals the
+		// typed struct, so the keys are JSON names. yaml.v3 is
+		// case-sensitive and falls back to lowercased Go field names for
+		// untagged fields, so a field JSON emits as "ContainerPath"
+		// silently decoded to its zero value (mount points arrived with
+		// SourceVolume "" -> ECS "Unknown volume ''").
 		cfg := &awsApi.EcsFargateInput{}
-		if err := decodeInputsAs(inputs, cfg); err != nil {
+		if err := decodeJSONInputsAs(inputs, cfg); err != nil {
 			return cfg, err
 		}
 		// Core's linked AWS /api can predate this plugin: its compose
@@ -693,6 +702,27 @@ func decodeInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) err
 		return err
 	}
 	return yaml.Unmarshal(b, out)
+}
+
+// decodeJSONInputsAs is decodeInputsAs's JSON twin, for inputs whose
+// producer is known to json.Marshal a typed struct (see the
+// ecs-fargate branch of decodeTypedConfig). JSON decoding is the exact
+// inverse of that encoding: it matches keys on the json tags
+// (case-insensitively), so it cannot drop a field the encoder emitted.
+// It is deliberately not used for the generic resource / provider /
+// state-store configs, which can reach core as untyped maps parsed from
+// YAML, where yaml's scalar coercion (e.g. an unquoted numeric account
+// ID into a string field) is relied on and JSON would reject it.
+func decodeJSONInputsAs[T any](inputs map[string]*scpluginv1.InputValue, out *T) error {
+	plain := make(map[string]any, len(inputs))
+	for k, v := range inputs {
+		plain[k] = unwrapInputValue(v)
+	}
+	b, err := json.Marshal(plain)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, out)
 }
 
 // unwrapInputValue recursively flattens an InputValue tree back into

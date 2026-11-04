@@ -75,10 +75,15 @@ type EcsFargateVolume struct {
 	Name string `json:"name" yaml:"name"`
 }
 
+// EcsFargateMountPoint crosses the SC core -> plugin bus (JSON-encoded by
+// core, decoded by the plugin), so it needs explicit json and yaml tags:
+// without them JSON emitted "ContainerPath"/"SourceVolume" while yaml.v3
+// looked for "containerpath"/"sourcevolume", and every mount point arrived
+// empty.
 type EcsFargateMountPoint struct {
-	ContainerPath string `pulumi:"containerPath"`
-	ReadOnly      bool   `pulumi:"readOnly"`
-	SourceVolume  string `pulumi:"sourceVolume"`
+	ContainerPath string `json:"containerPath" yaml:"containerPath" pulumi:"containerPath"`
+	ReadOnly      bool   `json:"readOnly" yaml:"readOnly" pulumi:"readOnly"`
+	SourceVolume  string `json:"sourceVolume" yaml:"sourceVolume" pulumi:"sourceVolume"`
 }
 
 type EcsFargateScale struct {
