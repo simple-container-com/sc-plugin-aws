@@ -96,6 +96,10 @@ func EcsFargate(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, para
 	if err := validateEcsContainerSecrets(crInput, params.ComputeContext); err != nil {
 		return output, err
 	}
+	// Before buildAndPushECSFargateImages registers ECR/image resources.
+	if err := validateEcsMountPoints(crInput); err != nil {
+		return output, err
+	}
 	if lo.FromPtr(crInput.CloudExtras).EnableHTTPS && crInput.Domain != "" {
 		if params.Registrar == nil {
 			return nil, errors.New("a DNS registrar is required for an ECS domain")
@@ -148,6 +152,9 @@ func EcsFargate(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, para
 
 func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.ProvisionParams, deployParams api.StackParams, crInput *aws.EcsFargateInput, ref *EcsFargateOutput) error {
 	if err := validateEcsContainerSecrets(crInput, params.ComputeContext); err != nil {
+		return err
+	}
+	if err := validateEcsMountPoints(crInput); err != nil {
 		return err
 	}
 	opts := []sdk.ResourceOption{
