@@ -96,6 +96,9 @@ func EcsFargate(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, para
 	if err := validateEcsContainerSecrets(crInput, params.ComputeContext); err != nil {
 		return output, err
 	}
+	if _, _, err := crInput.DeploymentPercents(); err != nil {
+		return output, errors.Wrapf(err, "invalid rolling update for stack %q in %q", stack.Name, deployParams.Environment)
+	}
 	// Before buildAndPushECSFargateImages registers ECR/image resources.
 	if err := validateEcsMountPoints(crInput); err != nil {
 		return output, err
@@ -837,12 +840,16 @@ func createEcsFargateCluster(ctx *sdk.Context, stack api.Stack, params pApi.Prov
 	params.Log.Info(ctx.Context(), "configure Fargate service for %q in %q with ingress container %q...",
 		stack.Name, deployParams.Environment, iContainer.Name)
 	ecsServiceName := awsResName(ecsSimpleClusterName, "svc")
+	deployMinHealthyPercent, deployMaxPercent, err := crInput.DeploymentPercents()
+	if err != nil {
+		return errors.Wrapf(err, "invalid rolling update for stack %q in %q", stack.Name, deployParams.Environment)
+	}
 	service, err := ecs.NewFargateService(ctx, fmt.Sprintf("%s-service", ecsSimpleClusterName), &ecs.FargateServiceArgs{
 		Cluster:                         cluster.Arn,
 		Name:                            sdk.String(ecsServiceName),
 		DesiredCount:                    sdk.Int(lo.If(crInput.Scale.Min == 0, 1).Else(crInput.Scale.Min)),
-		DeploymentMaximumPercent:        sdk.IntPtr(lo.If(crInput.Scale.Update.MaxPercent == 0, 200).Else(crInput.Scale.Update.MaxPercent)),
-		DeploymentMinimumHealthyPercent: sdk.IntPtr(lo.If(crInput.Scale.Update.MinHealthyPercent == 0, 100).Else(crInput.Scale.Update.MinHealthyPercent)),
+		DeploymentMaximumPercent:        sdk.IntPtr(deployMaxPercent),
+		DeploymentMinimumHealthyPercent: sdk.IntPtr(deployMinHealthyPercent),
 		ContinueBeforeSteadyState:       sdk.BoolPtr(false),
 		TaskDefinitionArgs: &ecs.FargateServiceTaskDefinitionArgs{
 			Family: sdk.String(fmt.Sprintf("%s-%s", stack.Name, deployParams.Environment)),

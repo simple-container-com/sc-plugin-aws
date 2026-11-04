@@ -119,6 +119,37 @@ func TestEcsUnchangedConfigMatchesOriginMain(t *testing.T) {
 	}
 }
 
+// cloudExtras.rollingUpdate changes only the service deployment percentages.
+func TestEcsRollingUpdateOnlyChangesDeploymentPercents(t *testing.T) {
+	zero, hundred := 0, 100
+	extras := &clouds.CloudExtras{RollingUpdate: &clouds.EcsRollingUpdate{MinHealthyPercent: &zero, MaxPercent: &hundred}}
+	want := renderEcsGraph(t, originMainEcsFargateCluster, compatibilityInput(nil, "app.example.com", false))
+	got := renderEcsGraph(t, createEcsFargateCluster, compatibilityInput(extras, "app.example.com", false))
+	var services int
+	for key, props := range got {
+		if !strings.HasPrefix(key, "awsx:ecs:FargateService/") {
+			continue
+		}
+		services++
+		if props["deploymentMinimumHealthyPercent"].NumberValue() != 0 || props["deploymentMaximumPercent"].NumberValue() != 100 {
+			t.Fatalf("rolling update not applied: min=%v max=%v", props["deploymentMinimumHealthyPercent"], props["deploymentMaximumPercent"])
+		}
+		if want[key]["deploymentMinimumHealthyPercent"].NumberValue() != 100 || want[key]["deploymentMaximumPercent"].NumberValue() != 200 {
+			t.Fatal("origin/main defaults are not 100/200")
+		}
+		props["deploymentMinimumHealthyPercent"] = want[key]["deploymentMinimumHealthyPercent"]
+		props["deploymentMaximumPercent"] = want[key]["deploymentMaximumPercent"]
+	}
+	if services != 1 {
+		t.Fatalf("expected one FargateService, got %d", services)
+	}
+	if !reflect.DeepEqual(want, got) {
+		w, _ := json.MarshalIndent(want, "", "  ")
+		g, _ := json.MarshalIndent(got, "", "  ")
+		t.Fatalf("rolling update changed more than deployment percents\nwant %s\ngot %s", w, g)
+	}
+}
+
 func TestEcsHardeningIsIndependentOptIn(t *testing.T) {
 	for _, tc := range []struct {
 		name                       string

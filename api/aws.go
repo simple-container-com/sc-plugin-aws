@@ -61,6 +61,12 @@ type CloudExtras struct {
 	// `secretsBundle: {}` in YAML is the minimal opt-in (defaults
 	// enabled). Mirrors the pointer-struct pattern k8s.VPA uses.
 	SecretsBundle *SecretsBundleConfig `json:"secretsBundle,omitempty" yaml:"secretsBundle,omitempty"`
+
+	// RollingUpdate overrides the ECS service deploymentConfiguration of an
+	// ecs-fargate cloud-compose stack. nil (or an unset field) keeps the
+	// defaults minimumHealthyPercent 100 / maximumPercent 200. See
+	// EcsRollingUpdate.
+	RollingUpdate *EcsRollingUpdate `json:"rollingUpdate,omitempty" yaml:"rollingUpdate,omitempty"`
 }
 
 // SecretsBundleConfig configures the opt-in Secrets Manager bundling
