@@ -242,8 +242,14 @@ func ToEcsFargateConfig(tpl any, composeCfg compose.Config, stackCfg *api.StackC
 		res.CloudExtras = awsCloudExtras
 	}
 	res.Scale.Update = FargateRollingUpdate{
-		MinHealthyPercent: 100,
-		MaxPercent:        200,
+		MinHealthyPercent: DefaultMinHealthyPercent,
+		MaxPercent:        DefaultMaxPercent,
+	}
+	// Reject an invalid cloudExtras.rollingUpdate at conversion time; the
+	// provisioner resolves (and re-checks) it, so it also works when an older
+	// core runs this converter and the block arrives via stackConfig.
+	if _, _, err := res.DeploymentPercents(); err != nil {
+		return nil, err
 	}
 
 	if composeCfg.Project == nil {
@@ -520,4 +526,62 @@ func (r *EcsFargateConfig) CredentialsValue() string {
 
 func (r *EcsFargateConfig) ProjectIdValue() string {
 	return r.Account
+}
+
+// Default ECS rolling-update percentages, applied when neither the converted
+// Scale.Update nor cloudExtras.rollingUpdate sets a value.
+const (
+	DefaultMinHealthyPercent = 100
+	DefaultMaxPercent        = 200
+)
+
+// EcsRollingUpdate is the opt-in `cloudExtras.rollingUpdate` block. Pointer
+// fields keep "unset" distinct from an explicit 0, so `minHealthyPercent: 0`
+// is honoured while an omitted field keeps its default.
+//
+// `minHealthyPercent: 0` + `maxPercent: 100` makes ECS stop the old task
+// before starting the new one: needed by a single-task service that holds an
+// exclusive lock on shared storage (e.g. a database datadir on EFS).
+type EcsRollingUpdate struct {
+	MinHealthyPercent *int `json:"minHealthyPercent,omitempty" yaml:"minHealthyPercent,omitempty"`
+	MaxPercent        *int `json:"maxPercent,omitempty" yaml:"maxPercent,omitempty"`
+}
+
+// DeploymentPercents resolves the ECS service minimumHealthyPercent and
+// maximumPercent. Without cloudExtras.rollingUpdate the result is exactly the
+// pre-existing behaviour (Scale.Update, 0 meaning the 100/200 default) and no
+// validation is applied. With it, the set fields override and the resolved
+// pair is validated.
+func (i *EcsFargateInput) DeploymentPercents() (minHealthyPercent, maxPercent int, err error) {
+	minHealthyPercent = lo.If(i.Scale.Update.MinHealthyPercent == 0, DefaultMinHealthyPercent).Else(i.Scale.Update.MinHealthyPercent)
+	maxPercent = lo.If(i.Scale.Update.MaxPercent == 0, DefaultMaxPercent).Else(i.Scale.Update.MaxPercent)
+
+	if i.CloudExtras == nil || i.CloudExtras.RollingUpdate == nil {
+		return minHealthyPercent, maxPercent, nil
+	}
+	ru := i.CloudExtras.RollingUpdate
+	if ru.MinHealthyPercent != nil {
+		minHealthyPercent = *ru.MinHealthyPercent
+	}
+	if ru.MaxPercent != nil {
+		maxPercent = *ru.MaxPercent
+	}
+	if err := validateRollingUpdate(minHealthyPercent, maxPercent); err != nil {
+		return 0, 0, err
+	}
+	return minHealthyPercent, maxPercent, nil
+}
+
+func validateRollingUpdate(minHealthyPercent, maxPercent int) error {
+	switch {
+	case minHealthyPercent < 0 || minHealthyPercent > 100:
+		return errors.Errorf("cloudExtras.rollingUpdate.minHealthyPercent must be between 0 and 100, got %d", minHealthyPercent)
+	case maxPercent < 100 || maxPercent > 200:
+		return errors.Errorf("cloudExtras.rollingUpdate.maxPercent must be between 100 and 200, got %d", maxPercent)
+	case maxPercent <= minHealthyPercent:
+		// e.g. 100/100: ECS can neither stop an old task nor start a new one,
+		// so the deployment never makes progress.
+		return errors.Errorf("cloudExtras.rollingUpdate: maxPercent (%d) must be greater than minHealthyPercent (%d), otherwise the rolling update cannot make progress", maxPercent, minHealthyPercent)
+	}
+	return nil
 }

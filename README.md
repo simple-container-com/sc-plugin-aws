@@ -223,3 +223,32 @@ This setting limits injected process environments; it does not create separate
 IAM identities. With the legacy shared execution/task role, workloads can still
 read task secrets through AWS APIs. Combine with `leastPrivilegeRoles` and avoid
 granting the runtime role secret-read actions when that access is unnecessary.
+
+## ECS rolling-update percentages
+
+By default an `ecs-fargate` service deploys with `minimumHealthyPercent: 100`
+and `maximumPercent: 200`: ECS starts the new task before stopping the old one.
+A single-task service that holds an exclusive lock on shared storage (for
+example a database whose datadir is on EFS) cannot run two tasks at once, so
+the new task fails and the rollout never finishes. Set
+`config.cloudExtras.rollingUpdate` in the stack's `client.yaml` to stop the old
+task first:
+
+```yaml
+config:
+  cloudExtras:
+    rollingUpdate:
+      minHealthyPercent: 0   # 0-100, default 100
+      maxPercent: 100        # 100-200, default 200
+```
+
+An omitted block or field keeps its default, so existing stacks see no change to
+their `deploymentConfiguration`. An explicit `0` is honoured. `maxPercent` must
+be greater than `minHealthyPercent` (100/100, including `maxPercent: 100` with
+the default minimum, is rejected because the deployment could never progress).
+Invalid values fail conversion, and the plugin checks again before creating
+resources. With `0`/`100` the service is unavailable between the old task
+stopping and the new one passing health checks.
+
+Like `containerSecrets`, this travels in the raw `stackConfig.cloudExtras`
+block, so it needs only this plugin release, not a new SC core.
