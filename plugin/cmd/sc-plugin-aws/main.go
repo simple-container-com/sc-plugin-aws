@@ -125,6 +125,19 @@ func (p *awsPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scp
 			{Package: "docker", Version: "4.11.2"},
 			{Package: "random", Version: "4.19.0"},
 		},
+		SafeToReplaceTypes: []string{
+			// ECS Task Definitions are revision-based: the Pulumi provider
+			// publishes revision N+1 on every `containerDefinitions`/`family`
+			// change, AWS retains revision N until no running task uses it,
+			// and the parent FargateService re-references the new ARN on
+			// the same deploy — additive, not destruction. Live-caught on
+			// forge-baas run 42077847984 the moment api 2026.11.19 landed
+			// in the fleet: SC core's S4 destructive-replace guard flagged
+			// every ECS deploy. Immediate unblock shipped as an in-tree
+			// allowlist in api #556; the plugin now owns the advertisement
+			// per api #557.
+			"aws:ecs/taskDefinition:TaskDefinition",
+		},
 	}, nil
 }
 
