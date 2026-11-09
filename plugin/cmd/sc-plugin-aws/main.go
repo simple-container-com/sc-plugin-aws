@@ -520,8 +520,17 @@ func (p *awsPlugin) ConvertStackConfig(ctx context.Context, req *scpluginv1.Conv
 		}
 		typedInput, err = awsApi.ToEcsFargateConfig(tplCfg, composeCfg, stackCfg)
 	case awsApi.TemplateTypeStaticWebsite:
+		// StackConfigStatic.Site is a NAMED field tagged
+		// `json:",inline" yaml:",inline"`. SC-core's sender json.Marshal
+		// doesn't honor the inline option and emits `"Site":{...}` nested;
+		// yaml.v3's inline decoder on this side would then leave Site
+		// zero. Use the JSON roundtrip helper that matches the sender's
+		// encoding — it decodes Site into the Go field correctly, so
+		// ToStaticSiteConfig below reads a populated Domain/BaseDnsZone/
+		// IndexDocument from stackCfg.Site.* and fills the top-level
+		// mirrors the Provision path reads.
 		stackCfg := &api.StackConfigStatic{}
-		if err := yamlRoundTrip(stackPlain, stackCfg); err != nil {
+		if err := jsonRoundTrip(stackPlain, stackCfg); err != nil {
 			return nil, errors.Wrap(err, "decode StackConfigStatic")
 		}
 		typedInput, err = awsApi.ToStaticSiteConfig(tplCfg, stackDir, stackName, stackCfg)
@@ -566,6 +575,28 @@ func yamlRoundTrip(src any, out any) error {
 		return err
 	}
 	return yaml.Unmarshal(b, out)
+}
+
+// jsonRoundTrip decodes a plain map[string]any (what InputsToPlain
+// returns from the bus's InputValue tree) into a typed struct via a
+// JSON round-trip. Use this for structs whose nested embeds use
+// `json:",inline"` on NAMED fields (e.g. api.StackConfigStatic's
+// `Site StaticSiteConfig json:",inline" yaml:",inline"`) — the
+// SC-core sender json.Marshals the Go value and `encoding/json`
+// does NOT honor `,inline`, so the wire carries a nested
+// `"Site":{...}` object keyed by the Go field name. yaml.v3's inline
+// decoder on the receiver expects fields flat at the parent level
+// and leaves Site zero, losing Domain/BaseDnsZone/IndexDocument.
+// json.Unmarshal honors the Go field name and re-hydrates Site
+// correctly. Live-caught 2026-11-09 on landing's forge-landing--staging
+// deploy (aws-static-website): empty Domain → s3.NewBucket(ctx,"",...)
+// → "resource name argument cannot be empty".
+func jsonRoundTrip(src any, out any) error {
+	b, err := json.Marshal(src)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, out)
 }
 
 func (p *awsPlugin) PreDestroy(_ context.Context, req *scpluginv1.PreDestroyRequest) (*scpluginv1.PreDestroyResponse, error) {
