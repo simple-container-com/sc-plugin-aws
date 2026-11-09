@@ -8,13 +8,15 @@ import (
 	"os"
 	"testing"
 
-	"github.com/compose-spec/compose-go/types"
-	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/compose-spec/compose-go/types"
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/clouds/compose"
+	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
+	"github.com/stretchr/testify/require"
+
 	awsApi "github.com/simple-container-com/sc-plugin-aws/api"
 )
 
@@ -163,4 +165,60 @@ func requestInputs(t *testing.T, cfg any) map[string]*scpluginv1.InputValue {
 		}
 	}
 	return encode(raw).GetMapValue().GetFields()
+}
+
+// Regression: aws-static-website on landing's forge-landing--staging
+// deploy 2026-11-09 failed s3.NewBucket with
+// `resource name argument (for URN creation) cannot be empty` because
+// ConvertStackConfig yaml-round-tripped a JSON-encoded StackConfigStatic
+// whose Site field is tagged `json:",inline" yaml:",inline"`.
+// `encoding/json` ignores `,inline` on NAMED fields and emits
+// `"Site":{...}` nested; yaml.v3's inline decoder expects flat fields
+// at the parent level and left Site zero, so ToStaticSiteConfig's
+// Site.Domain-sourced mirror population wrote "". This pins that the
+// stack-config decode roundtrip now preserves Site.Domain through to
+// the SiteDomain mirror on the response.
+func TestConvertStackConfig_StaticWebsiteRoundTripsSiteDomain(t *testing.T) {
+	req := &scpluginv1.ConvertStackConfigRequest{
+		Header:       &scpluginv1.RequestHeader{StackName: "forge-landing--staging"},
+		TemplateType: awsApi.TemplateTypeStaticWebsite,
+		StackName:    "forge-landing--staging",
+		StackDir:     "/tmp",
+		TemplateConfig: requestInputs(t, map[string]any{
+			"credentials": `{"access":"k"}`,
+			"account":     "123456789012",
+			"region":      "eu-central-1",
+		}),
+		// requestInputs does json.Marshal first — exactly matching
+		// SC-core's sender shape, which emits `"Site":{...}` because
+		// `encoding/json` does not honor `json:",inline"`.
+		StackConfig: requestInputs(t, &api.StackConfigStatic{
+			BundleDir: "./bundle",
+			Location:  "eu-central-1",
+			Site: api.StaticSiteConfig{
+				Domain:        "forge.simple-container.com",
+				BaseDnsZone:   "simple-container.com",
+				IndexDocument: "index.html",
+				ErrorDocument: "404.html",
+			},
+		}),
+	}
+	p := &awsPlugin{progress: scPlugin.NewPublisher(0)}
+	resp, err := p.ConvertStackConfig(nil, req)
+	require.NoError(t, err, "ConvertStackConfig must not fail")
+	require.NotNil(t, resp)
+
+	// The Provision-side decode path ends up reading EffectiveDomain,
+	// which prefers the top-level `siteDomain` mirror over `Site.Domain`
+	// (yaml.v3's inline decode trap). If `stackCfg.Site.Domain` arrived
+	// empty at ToStaticSiteConfig, SiteDomain would be "" here and the
+	// live `resource name argument cannot be empty` reproduces.
+	siteDomainIV, ok := resp.Input["siteDomain"]
+	require.True(t, ok, "response must carry siteDomain mirror")
+	require.Equal(t, "forge.simple-container.com", siteDomainIV.GetStringValue())
+
+	// BaseDnsZone also flows through the same Site.* chain — pin it too.
+	siteZoneIV, ok := resp.Input["siteBaseDnsZone"]
+	require.True(t, ok, "response must carry siteBaseDnsZone mirror")
+	require.Equal(t, "simple-container.com", siteZoneIV.GetStringValue())
 }
