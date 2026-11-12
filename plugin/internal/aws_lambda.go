@@ -11,17 +11,16 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/samber/lo"
-
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/apigatewayv2"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/cloudwatch"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/iam"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/lambda"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
-
+	"github.com/samber/lo"
 	"github.com/simple-container-com/api/pkg/api"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 	"github.com/simple-container-com/api/pkg/util"
+
 	"github.com/simple-container-com/sc-plugin-aws/api"
 )
 
@@ -57,6 +56,22 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 	}
 	crInput.AccountConfig.KeepBoundary(tplBoundary)
 	stackConfig := crInput.StackConfig
+
+	// SC Components side-channel (slice 1a.1, design doc §#19 path (b),
+	// api #601). When this Lambda is being dispatched as a Component (operator
+	// server.yaml declares `type: <component-type>, config: {deployTo: lambda,
+	// image: ..., env: ..., signingKey: ...}`), api core populates
+	// `input.ComponentRaw` with the component's .Raw map. Overlay the
+	// component's image/env/ingress/signingKey onto stackConfig so the rest of
+	// this function (buildAndPushDockerImageV2, env injection, Function URL
+	// DNS) sees them. The plugin's Schema advertises `supports_component:
+	// [aws-lambda]`; api core's parse-time validator refuses dispatch unless
+	// this opt-in is present.
+	if input.ComponentRaw != nil {
+		if err := applyComponentRawToSingleImage(&stackConfig, input.ComponentRaw); err != nil {
+			return nil, errors.Wrapf(err, "lambda component dispatch for %q in %q: overlay ComponentRaw", stack.Name, deployParams.Environment)
+		}
+	}
 
 	awsCloudExtras := &aws.CloudExtras{}
 	if stackConfig.CloudExtras != nil {
