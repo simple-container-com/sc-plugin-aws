@@ -114,6 +114,20 @@ func (p *awsPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scp
 		SecretsProviderTypes: []string{
 			awsApi.SecretsProviderTypeAwsKms,
 		},
+		// SupportsComponent — slice 1a.1 of sc-components-platform (api #601,
+		// design §#19 path (b)). This plugin's aws-lambda ProvisionFunc reads
+		// `input.ComponentRaw` and overlays the component's `image` / `env` /
+		// `ingress.hostname` / `signingKey` onto its typed StackConfigSingleImage
+		// before building the Lambda. Without this opt-in, api core refuses
+		// Component dispatch into aws-lambda at parse time (prevents the
+		// silent-fall-through failure mode the first component-dispatch smoke
+		// against lambda hit).
+		//
+		// ecs-fargate is NOT in this list yet — adding it needs the same
+		// overlay in plugin/internal/ecs_fargate.go. Follow-up slice.
+		SupportsComponent: []string{
+			awsApi.TemplateTypeAwsLambda,
+		},
 		PulumiPlugins: []*scpluginv1.PulumiPluginRequirement{
 			// pulumi-aws is the big one (~75 MB in the module cache).
 			// Pin against api/go.mod — bumping either side without the

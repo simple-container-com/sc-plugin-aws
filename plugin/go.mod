@@ -1,6 +1,6 @@
 module github.com/simple-container-com/sc-plugin-aws/plugin
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/MShekow/directory-checksum v1.4.18
@@ -23,7 +23,7 @@ require (
 	github.com/pulumi/pulumi-random/sdk/v4 v4.21.0
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
 	github.com/samber/lo v1.53.0
-	github.com/simple-container-com/api v0.0.0-20261105203730-546fe3b75055
+	github.com/simple-container-com/api v0.0.0-20261112103502-f172da4c723f
 	github.com/simple-container-com/sc-plugin-aws/api v0.0.0
 	github.com/spf13/afero v1.15.0
 	github.com/spf13/cobra v1.10.2
@@ -115,7 +115,7 @@ require (
 	github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/kevinburke/ssh_config v1.2.0 // indirect
-	github.com/klauspost/compress v1.18.7 // indirect
+	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect

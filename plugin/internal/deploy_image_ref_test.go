@@ -36,8 +36,15 @@ var permittedRuntimeImageExprs = map[string]bool{
 // does exist for it; it is simply not wired through resolveDeployImageRef and
 // nothing signs it. TODO: point alerts.go at cfg.helpersImage.RepoDigest and
 // delete this entry.
+//
+// componentImageConfig is the SC-Components dispatch overlay in
+// component_raw.go — it writes api.StackConfigSingleImage.Image, which is
+// SC build-config (dockerfile / build args), NOT a runtime image reference
+// (lambda ImageUri / ECS TaskDef Image). The lint matches by field name
+// alone, so we whitelist by distinctive RHS expression.
 var allowedTagReferences = map[string]bool{
 	"cfg.helpersImage.ImageName": true,
+	"componentImageConfig":       true,
 }
 
 func TestRuntimeImageReferencesUseTheDigest(t *testing.T) {
