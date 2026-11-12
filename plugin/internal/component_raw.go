@@ -124,6 +124,104 @@ func applyComponentRawToSingleImage(cfg *api.StackConfigSingleImage, raw map[str
 		}
 	}
 
+	// cloudExtras: per-key merge onto cfg.CloudExtras. cfg.CloudExtras is
+	// typed `*any` on the SC-core side (an opaque container; aws-lambda's
+	// provisioner later ConvertDescriptor's it into a typed *aws.CloudExtras).
+	// So the overlay works at the map level, not the struct level.
+	//
+	// Merge rules match the design doc's "operator wins on compute shape":
+	//   - SCALAR keys (e.g. lambdaRoutingType, lambdaInvokeMode, bools): if
+	//     the operator already set the key, keep it; otherwise take the
+	//     component's.
+	//   - LIST keys (lambdaSchedules, awsRoles): APPEND-merge — operator's
+	//     entries first (preserving ordering), then component's. A backup
+	//     Component declaring one schedule + an operator declaring one
+	//     schedule produces a Lambda with two schedules, not one or the
+	//     other. awsRoles follow the same logic — a role list is additive.
+	//
+	// The list-key allowlist is maintained by name here because `*any` has
+	// no type information to discriminate from. Adding a new list-typed
+	// field to aws.CloudExtras MUST add its JSON tag to cloudExtrasListKeys
+	// below, or the overlay will treat it as a scalar and operator-wins
+	// will silently drop the component's contribution. That's a per-struct
+	// trap worth flagging in review when aws.CloudExtras grows.
+	if v, ok := raw["cloudExtras"]; ok && v != nil {
+		if err := mergeComponentCloudExtras(cfg, v); err != nil {
+			return errors.Wrap(err, "cloudExtras")
+		}
+	}
+
+	return nil
+}
+
+// cloudExtrasListKeys names the JSON keys on aws.CloudExtras that are
+// list-typed, keyed by the wire-level name (JSON tag). The overlay uses
+// this set to pick APPEND-merge semantics over operator-wins for those
+// keys. See the per-struct-trap note above `mergeComponentCloudExtras`'s
+// caller — adding a new list field to aws.CloudExtras without adding its
+// name here silently drops the component's contribution.
+var cloudExtrasListKeys = map[string]bool{
+	"lambdaSchedules": true,
+	"awsRoles":        true,
+}
+
+func mergeComponentCloudExtras(cfg *api.StackConfigSingleImage, raw any) error {
+	comp, ok := raw.(map[string]any)
+	if !ok {
+		return errors.Errorf("want map, got %T", raw)
+	}
+	// Normalise cfg.CloudExtras to a map we can mutate. nil → fresh map;
+	// an existing *any pointing to a map → use its map; any other shape
+	// is an operator-authored non-map (ints, strings, structs) which is
+	// a config bug SC core would have caught earlier — reject rather
+	// than silently drop it.
+	var opMap map[string]any
+	if cfg.CloudExtras != nil {
+		switch existing := (*cfg.CloudExtras).(type) {
+		case map[string]any:
+			opMap = existing
+		case nil:
+			opMap = map[string]any{}
+		default:
+			return errors.Errorf("cfg.CloudExtras is %T, expected map or nil", existing)
+		}
+	} else {
+		opMap = map[string]any{}
+	}
+	for k, cv := range comp {
+		if cloudExtrasListKeys[k] {
+			// APPEND-merge: existing list first (may be nil), component's
+			// list appended. Empty-list-from-component is a no-op, not an
+			// erase.
+			compList, ok := cv.([]any)
+			if !ok {
+				return errors.Errorf("%s: want list, got %T", k, cv)
+			}
+			existing, _ := opMap[k].([]any)
+			if len(compList) == 0 {
+				// Preserve the existing list (if any) when the component
+				// contributes nothing to a list field. Explicitly avoids
+				// writing a non-nil empty []any into a previously-nil slot
+				// (an operator reading the deploy's rendered state would
+				// see a present-but-empty key where they declared nothing).
+				continue
+			}
+			opMap[k] = append(existing, compList...)
+		} else {
+			// Operator wins on scalars: only fill the slot if operator
+			// hasn't. A scalar-shaped collision where both operator and
+			// component wrote the same key means the operator's value
+			// stays, even if the component's was different.
+			if _, present := opMap[k]; !present {
+				opMap[k] = cv
+			}
+		}
+	}
+	// Re-pack as *any. Even if opMap came in via cfg.CloudExtras's existing
+	// pointer, we re-assign to make the ownership explicit — the component
+	// overlay is a merge, not a shared-reference mutation.
+	asAny := any(opMap)
+	cfg.CloudExtras = &asAny
 	return nil
 }
 
