@@ -257,6 +257,28 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 	if cliStackName == "" {
 		cliStackName = req.GetHeader().GetStackName()
 	}
+	// ComponentRaw — slice 1a.1 side-channel (api #601 / v2026.11.53).
+	// SC core dispatches an SC-Component resource (a resource whose owning
+	// plugin advertises SupportsComponent for the chosen `deployTo:` template)
+	// by routing the component's raw `.Raw` map through ProvisionRequest's
+	// `component_raw` bytes field. The plugin is responsible for carrying that
+	// through onto `api.ResourceInput.ComponentRaw`; the template-specific
+	// ProvisionFunc (aws_lambda.go) then overlays the fields onto its typed
+	// StackConfig before building the cloud resource.
+	//
+	// Omitting this copy was the live-caught trap on the 4th fleet smoke
+	// (2026-11-12, after sc-plugin-aws#16 released): the overlay was already
+	// wired inside Lambda() but input.ComponentRaw was always nil because
+	// the plugin's Provision never populated it from the wire, so
+	// stackConfig.Image stayed nil and buildAndPushDockerImageV2 panicked
+	// on the first access. Design doc §#19 path (b) spec is explicit: the
+	// JSON-encoded map arrives as bytes and the plugin unmarshals once.
+	var componentRaw map[string]any
+	if raw := req.GetComponentRaw(); len(raw) > 0 {
+		if err := json.Unmarshal(raw, &componentRaw); err != nil {
+			return nil, errors.Wrap(err, "unmarshal ProvisionRequest.component_raw JSON")
+		}
+	}
 	input := api.ResourceInput{
 		Descriptor: &api.ResourceDescriptor{
 			Type:   req.GetResourceType(),
@@ -267,6 +289,7 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 			StackName:   cliStackName,
 			Environment: req.GetHeader().GetEnvironment(),
 		},
+		ComponentRaw: componentRaw,
 	}
 
 	// Build an aws Pulumi provider INSIDE the plugin's own pctx. A
