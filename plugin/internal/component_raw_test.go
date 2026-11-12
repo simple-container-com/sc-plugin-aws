@@ -178,3 +178,100 @@ func TestApplyComponentRawToSingleImage_FullHappyPath(t *testing.T) {
 	Ω(cfg.Domain).To(Equal("dummy.simple-forge.com"))
 	Ω(cfg.Secrets["SERVICE_JWT_SECRET"]).To(Equal("${secret:SMOKE}"))
 }
+
+// cloudExtras overlay — P1.1 of the backup plan 2026-11-12. The three
+// cases below cover the merge rules sc-components asked for:
+//   1. component writes a scalar into an empty slot.
+//   2. operator's scalar wins on collision.
+//   3. list fields (lambdaSchedules, awsRoles) append-merge.
+
+func TestApplyComponentRawToSingleImage_CloudExtrasFillsEmptySlot(t *testing.T) {
+	RegisterTestingT(t)
+	// Operator did not set cfg.CloudExtras at all. Component sets
+	// lambdaRoutingType — expect it to land on the final map.
+	cfg := &api.StackConfigSingleImage{}
+	Ω(applyComponentRawToSingleImage(cfg, map[string]any{
+		"cloudExtras": map[string]any{
+			"lambdaRoutingType": "function-url",
+		},
+	})).To(Succeed())
+	Ω(cfg.CloudExtras).NotTo(BeNil())
+	m, ok := (*cfg.CloudExtras).(map[string]any)
+	Ω(ok).To(BeTrue(), "cfg.CloudExtras must be a map post-overlay")
+	Ω(m["lambdaRoutingType"]).To(Equal("function-url"))
+}
+
+func TestApplyComponentRawToSingleImage_CloudExtrasOperatorWinsOnScalar(t *testing.T) {
+	RegisterTestingT(t)
+	// Operator set lambdaInvokeMode=BUFFERED. Component also sets it, to
+	// RESPONSE_STREAM. Operator's value stays — matches the design doc's
+	// "operator wins on compute shape" rule.
+	existing := any(map[string]any{
+		"lambdaInvokeMode": "BUFFERED",
+	})
+	cfg := &api.StackConfigSingleImage{CloudExtras: &existing}
+	Ω(applyComponentRawToSingleImage(cfg, map[string]any{
+		"cloudExtras": map[string]any{
+			"lambdaInvokeMode": "RESPONSE_STREAM",
+		},
+	})).To(Succeed())
+	m, _ := (*cfg.CloudExtras).(map[string]any)
+	Ω(m["lambdaInvokeMode"]).To(Equal("BUFFERED"),
+		"operator's lambdaInvokeMode must win on scalar collision")
+}
+
+func TestApplyComponentRawToSingleImage_CloudExtrasListsAppendMerge(t *testing.T) {
+	RegisterTestingT(t)
+	// Operator declares one lambdaSchedule + two awsRoles. Component declares
+	// one schedule + one role. Final result MUST carry both operator entries
+	// AND both component entries — the lists append, they don't override.
+	// Operator order comes first, preserving author-declared ordering.
+	existing := any(map[string]any{
+		"lambdaSchedules": []any{
+			map[string]any{"name": "op-tick", "expression": "rate(5 minutes)", "request": "{}"},
+		},
+		"awsRoles": []any{"s3:GetObject", "s3:PutObject"},
+	})
+	cfg := &api.StackConfigSingleImage{CloudExtras: &existing}
+	Ω(applyComponentRawToSingleImage(cfg, map[string]any{
+		"cloudExtras": map[string]any{
+			"lambdaSchedules": []any{
+				map[string]any{"name": "backup-tick", "expression": "rate(1 minute)", "request": "{}"},
+			},
+			"awsRoles": []any{"ecs:RunTask"},
+		},
+	})).To(Succeed())
+	m, _ := (*cfg.CloudExtras).(map[string]any)
+	schedules, _ := m["lambdaSchedules"].([]any)
+	Ω(schedules).To(HaveLen(2), "operator + component schedules append, not override")
+	Ω(schedules[0].(map[string]any)["name"]).To(Equal("op-tick"),
+		"operator's entries come first — preserves author-declared ordering")
+	Ω(schedules[1].(map[string]any)["name"]).To(Equal("backup-tick"))
+	roles, _ := m["awsRoles"].([]any)
+	Ω(roles).To(HaveLen(3))
+	Ω(roles).To(ContainElements("s3:GetObject", "s3:PutObject", "ecs:RunTask"))
+}
+
+// Defensive cases — malformed wire shapes should return typed errors, not
+// silently drop data. Mirrors the contract of parseComponentImage /
+// parseComponentStringMap.
+
+func TestApplyComponentRawToSingleImage_CloudExtrasWrongShape(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{}
+	err := applyComponentRawToSingleImage(cfg, map[string]any{"cloudExtras": 42})
+	Ω(err).To(HaveOccurred())
+	Ω(err.Error()).To(ContainSubstring("cloudExtras"))
+}
+
+func TestApplyComponentRawToSingleImage_CloudExtrasListFieldWrongShape(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{}
+	err := applyComponentRawToSingleImage(cfg, map[string]any{
+		"cloudExtras": map[string]any{
+			"awsRoles": "ecs:RunTask", // string where []any is expected
+		},
+	})
+	Ω(err).To(HaveOccurred())
+	Ω(err.Error()).To(ContainSubstring("awsRoles"))
+}
