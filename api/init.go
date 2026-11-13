@@ -39,6 +39,9 @@ func init() {
 
 		// security
 		ResourceTypeCloudTrailSecurityAlerts: ReadCloudTrailSecurityAlertsConfig,
+
+		// ses
+		ResourceTypeSesSmtpUser: ReadSesSmtpUserConfig,
 	})
 
 	api.RegisterProvisionerFieldConfig(api.ProvisionerFieldConfigRegister{
@@ -78,6 +81,7 @@ func init() {
 			ResourceTypeRdsPostgres,
 			ResourceTypeRdsMysql,
 			ResourceTypeCloudTrailSecurityAlerts,
+			ResourceTypeSesSmtpUser,
 			// aws-kms here is the Pulumi state-secrets-provider TYPE
 			// (secretsProvider: {type: aws-kms, ...} on the stack
 			// config) and its matching KMS-key provisioner — both move

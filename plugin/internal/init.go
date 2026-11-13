@@ -22,10 +22,12 @@ func init() {
 		aws.ResourceTypeRdsMysql:                 RdsMysql,
 		aws.ResourceTypeEcrRepository:            EcrRepository,
 		aws.ResourceTypeCloudTrailSecurityAlerts: CloudTrailSecurityAlerts,
+		aws.ResourceTypeSesSmtpUser:              SesSmtpUser,
 	})
 	api.RegisterComputeProcessor(map[string]api.ComputeProcessorFunc{
 		aws.ResourceTypeS3Bucket:    S3BucketComputeProcessor,
 		aws.ResourceTypeRdsPostgres: RdsPostgresComputeProcessor,
 		aws.ResourceTypeRdsMysql:    RdsMysqlComputeProcessor,
+		aws.ResourceTypeSesSmtpUser: SesSmtpUserComputeProcessor,
 	})
 }
