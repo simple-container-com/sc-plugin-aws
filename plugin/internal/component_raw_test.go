@@ -275,3 +275,100 @@ func TestApplyComponentRawToSingleImage_CloudExtrasListFieldWrongShape(t *testin
 	Ω(err).To(HaveOccurred())
 	Ω(err.Error()).To(ContainSubstring("awsRoles"))
 }
+
+// ---------- slice 1e.4g.2: storage + metadata block → env ----------
+
+func TestApplyComponentRawToSingleImage_StorageBlockOverlaysEnv(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{}
+	err := applyComponentRawToSingleImage(cfg, map[string]any{
+		"storage": map[string]any{
+			"type":   "s3",
+			"bucket": "my-backups",
+			"region": "eu-central-1",
+		},
+	})
+	Ω(err).ToNot(HaveOccurred())
+	Ω(cfg.Env).To(HaveKeyWithValue("STORAGE_TYPE", "s3"))
+	Ω(cfg.Env).To(HaveKeyWithValue("STORAGE_BUCKET", "my-backups"))
+	Ω(cfg.Env).To(HaveKeyWithValue("STORAGE_REGION", "eu-central-1"))
+}
+
+func TestApplyComponentRawToSingleImage_MetadataBlockOverlaysEnv(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{}
+	err := applyComponentRawToSingleImage(cfg, map[string]any{
+		"metadata": map[string]any{
+			"type": "colocated",
+			"uri":  "",
+		},
+	})
+	Ω(err).ToNot(HaveOccurred())
+	Ω(cfg.Env).To(HaveKeyWithValue("METADATA_TYPE", "colocated"))
+	Ω(cfg.Env).To(HaveKeyWithValue("METADATA_URI", ""))
+}
+
+func TestApplyComponentRawToSingleImage_StorageBlockCamelCaseSplit(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{}
+	err := applyComponentRawToSingleImage(cfg, map[string]any{
+		"storage": map[string]any{
+			"accessKey":    "AKIA...",
+			"usePathStyle": true,
+		},
+	})
+	Ω(err).ToNot(HaveOccurred())
+	Ω(cfg.Env).To(HaveKeyWithValue("STORAGE_ACCESS_KEY", "AKIA..."))
+	Ω(cfg.Env).To(HaveKeyWithValue("STORAGE_USE_PATH_STYLE", "true"))
+}
+
+func TestApplyComponentRawToSingleImage_StorageBlockExplicitEnvWins(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{Env: map[string]string{"STORAGE_TYPE": "filesystem"}}
+	err := applyComponentRawToSingleImage(cfg, map[string]any{
+		"env": map[string]any{
+			"STORAGE_BUCKET": "operator-override",
+		},
+		"storage": map[string]any{
+			"type":   "s3",           // operator-pre-set; should NOT be overwritten
+			"bucket": "from-block",   // env block SET this via `env:` → `env:` wins
+			"region": "eu-central-1", // not in env → block value lands
+		},
+	})
+	Ω(err).ToNot(HaveOccurred())
+	Ω(cfg.Env).To(HaveKeyWithValue("STORAGE_TYPE", "filesystem")) // pre-existing kept
+	Ω(cfg.Env).To(HaveKeyWithValue("STORAGE_BUCKET", "operator-override"))
+	Ω(cfg.Env).To(HaveKeyWithValue("STORAGE_REGION", "eu-central-1")) // block-derived
+}
+
+func TestApplyComponentRawToSingleImage_StorageBlockNonScalarSkipped(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{}
+	err := applyComponentRawToSingleImage(cfg, map[string]any{
+		"storage": map[string]any{
+			"type":   "s3",
+			"nested": map[string]any{"wat": "no"}, // skipped silently
+			"tags":   []any{"a", "b"},             // skipped silently
+		},
+	})
+	Ω(err).ToNot(HaveOccurred())
+	Ω(cfg.Env).To(HaveKeyWithValue("STORAGE_TYPE", "s3"))
+	Ω(cfg.Env).ToNot(HaveKey("STORAGE_NESTED"))
+	Ω(cfg.Env).ToNot(HaveKey("STORAGE_TAGS"))
+}
+
+func TestBlockToEnvKey(t *testing.T) {
+	RegisterTestingT(t)
+	cases := []struct {
+		block, field, want string
+	}{
+		{"storage", "type", "STORAGE_TYPE"},
+		{"metadata", "uri", "METADATA_URI"},
+		{"storage", "accessKey", "STORAGE_ACCESS_KEY"},
+		{"storage", "usePathStyle", "STORAGE_USE_PATH_STYLE"},
+		{"storage", "sqlitePath", "STORAGE_SQLITE_PATH"},
+	}
+	for _, tc := range cases {
+		Ω(blockToEnvKey(tc.block, tc.field)).To(Equal(tc.want), "%s.%s", tc.block, tc.field)
+	}
+}

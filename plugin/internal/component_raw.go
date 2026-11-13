@@ -4,6 +4,9 @@
 package aws
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/pkg/errors"
 	"github.com/simple-container-com/api/pkg/api"
 )
@@ -121,6 +124,47 @@ func applyComponentRawToSingleImage(cfg *api.StackConfigSingleImage, raw map[str
 		// explicit secret-env declarations elsewhere in the fleet.
 		if _, present := cfg.Secrets["SERVICE_JWT_SECRET"]; !present {
 			cfg.Secrets["SERVICE_JWT_SECRET"] = s
+		}
+	}
+
+	// storage + metadata (generic Component config blocks → env):
+	// slice 1e.4g.2 of sc-components-platform. Any Component may
+	// declare top-level `storage:` / `metadata:` blocks in server.yaml;
+	// this overlay translates each sub-field into a conventional env
+	// entry so the deployed service reads its backend selection from
+	// env without the operator having to duplicate values in `env:`.
+	//
+	// Convention: `<block>.<field>` → `<BLOCK_UPPER>_<FIELD_UPPER>`.
+	// `storage.type: s3` → env `STORAGE_TYPE=s3`.
+	// `metadata.uri: ${secret:...}` → env `METADATA_URI=${secret:...}`.
+	//
+	// Precedence: an explicit `env:` entry wins over a block-derived
+	// entry. Operators who want to override a specific field just set
+	// the env; the block-derived entries fill the slots the env didn't
+	// already set.
+	//
+	// Scope: ONLY top-level map-valued blocks whose fields are string-
+	// shaped. Nested maps / lists / numbers are not translated (operators
+	// who need richer shapes can still write env: directly). Bools serialise
+	// as "true"/"false" — a common env idiom.
+	for _, blockKey := range []string{"storage", "metadata"} {
+		raw, ok := raw[blockKey].(map[string]any)
+		if !ok || raw == nil {
+			continue
+		}
+		if cfg.Env == nil {
+			cfg.Env = map[string]string{}
+		}
+		for k, val := range raw {
+			envKey := blockToEnvKey(blockKey, k)
+			if _, present := cfg.Env[envKey]; present {
+				continue // explicit env: wins
+			}
+			strVal, ok := scalarToString(val)
+			if !ok {
+				continue // skip non-scalar sub-fields (nested shapes are advisory)
+			}
+			cfg.Env[envKey] = strVal
 		}
 	}
 
@@ -308,4 +352,68 @@ func parseComponentStringMap(v any, field string) (map[string]string, error) {
 		out[k] = s
 	}
 	return out, nil
+}
+
+// blockToEnvKey turns a (blockName, fieldName) pair into the
+// conventional env variable name. `storage`, `type` → `STORAGE_TYPE`.
+// `metadata`, `sqlitePath` → `METADATA_SQLITE_PATH`. CamelCase fields
+// split on upper-case boundaries so operators who write `accessKey:`
+// end up with ACCESS_KEY, not ACCESSKEY.
+//
+// Slice 1e.4g.2 of sc-components-platform.
+func blockToEnvKey(block, field string) string {
+	var b strings.Builder
+	b.Grow(len(block) + len(field) + 8)
+	for i := 0; i < len(block); i++ {
+		c := block[i]
+		if c >= 'A' && c <= 'Z' && i > 0 {
+			b.WriteByte('_')
+		}
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		b.WriteByte(c)
+	}
+	b.WriteByte('_')
+	for i := 0; i < len(field); i++ {
+		c := field[i]
+		if c >= 'A' && c <= 'Z' && i > 0 {
+			b.WriteByte('_')
+		}
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// scalarToString serialises a scalar JSON-decoded value to a string
+// an env var can carry. Returns ok=false for non-scalar shapes (maps,
+// lists) — the overlay skips those so nested config blocks stay
+// advisory (operator must write them in `env:` explicitly if the
+// service needs them).
+func scalarToString(v any) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case bool:
+		if x {
+			return "true", true
+		}
+		return "false", true
+	case int:
+		return fmt.Sprintf("%d", x), true
+	case int64:
+		return fmt.Sprintf("%d", x), true
+	case float64:
+		// YAML decoders emit numbers as float64; preserve integer shape
+		// when round-tripping fits.
+		if x == float64(int64(x)) {
+			return fmt.Sprintf("%d", int64(x)), true
+		}
+		return fmt.Sprintf("%g", x), true
+	default:
+		return "", false
+	}
 }
