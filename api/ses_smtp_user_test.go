@@ -41,6 +41,11 @@ func TestSesSmtpUserValidate(t *testing.T) {
 	Expect((&SesSmtpUser{Identities: []string{" "}}).Validate()).To(MatchError(ContainSubstring("identities[0]")))
 	Expect((&SesSmtpUser{Identities: []string{"innmind.com"}, FromAddresses: []string{""}}).Validate()).
 		To(MatchError(ContainSubstring("fromAddresses[0]")))
+	for _, id := range []string{"*", "*.innmind.com", "innmind.co?", "arn:aws:ses:eu-central-1:645119433725:identity/*", "arn:aws:ses:eu-central-1:*:identity/innmind.com"} {
+		Expect((&SesSmtpUser{Identities: []string{"innmind.com", id}}).Validate()).
+			To(MatchError(ContainSubstring("identities[1]")), id)
+		Expect((&SesSmtpUser{Identities: []string{id}}).Validate()).To(MatchError(ContainSubstring("wildcard")), id)
+	}
 	Expect((&SesSmtpUser{Identities: []string{"innmind.com", "arn:aws:ses:eu-central-1:645119433725:identity/x.com"}}).Validate()).To(Succeed())
 }
 

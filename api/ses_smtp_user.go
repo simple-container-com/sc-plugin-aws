@@ -56,6 +56,12 @@ func (c *SesSmtpUser) Validate() error {
 		if strings.TrimSpace(id) == "" {
 			return errors.Errorf("%s: `identities[%d]` is empty", ResourceTypeSesSmtpUser, i)
 		}
+		// IAM treats `*` and `?` in a resource ARN as patterns, so they
+		// would grant sending as every matching (including future) identity.
+		if strings.ContainsAny(id, "*?") {
+			return errors.Errorf("%s: `identities[%d]` (%q) contains a wildcard (`*` or `?`); list each SES identity explicitly",
+				ResourceTypeSesSmtpUser, i, id)
+		}
 	}
 	for i, from := range c.FromAddresses {
 		if strings.TrimSpace(from) == "" {

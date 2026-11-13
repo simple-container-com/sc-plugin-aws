@@ -244,6 +244,8 @@ func TestSesSmtpUser_RejectsInvalidConfigBeforeCreatingResources(t *testing.T) {
 		// af-south-1 is an SES region, but has no SMTP endpoint.
 		"region without smtp endpoint":             {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Region: "af-south-1", Credentials: creds}, Identities: []string{"innmind.com"}}, `region "af-south-1" has no Amazon SES SMTP endpoint`},
 		"credentials region without smtp endpoint": {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Credentials: api.Credentials{Credentials: `{"region":"il-central-1"}`}}, Identities: []string{"innmind.com"}}, `"il-central-1"`},
+		"wildcard identity":                        {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Credentials: creds}, Identities: []string{"innmind.com", "*"}}, "wildcard"},
+		"wildcard identity arn":                    {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Credentials: creds}, Identities: []string{"arn:aws:ses:eu-central-1:645119433725:identity/innmind.co?"}}, "wildcard"},
 		"name with underscore":                     {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Credentials: creds}, Name: "mail_a", Identities: []string{"innmind.com"}}, `name "mail_a"`},
 		"name with uppercase":                      {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Credentials: creds}, Name: "mailA", Identities: []string{"innmind.com"}}, `name "mailA"`},
 	} {

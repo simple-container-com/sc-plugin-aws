@@ -300,7 +300,7 @@ resources:
 
 | Config | Required | Meaning |
 | --- | --- | --- |
-| `identities` | yes | SES identities the user may send as. A bare name becomes `arn:aws:ses:<region>:<account>:identity/<name>`; values starting with `arn:` are used as-is. |
+| `identities` | yes | SES identities the user may send as. A bare name becomes `arn:aws:ses:<region>:<account>:identity/<name>`; values starting with `arn:` are used as-is. Wildcards (`*`, `?`) are rejected: IAM would treat them as patterns matching every (including future) identity. |
 | `region` | no | SES region of the SMTP endpoint and password. Defaults to the region of the `${auth:...}` credentials. Must be a region with an [SES SMTP endpoint](https://docs.aws.amazon.com/general/latest/gr/ses.html#ses_smtp_endpoints) (e.g. not `af-south-1`, `il-central-1`, `eu-south-1`); otherwise provisioning fails before any IAM resource is created. |
 | `account` | no | Account ID for the identity ARNs. Defaults to the credentials' account, else `sts:GetCallerIdentity`. |
 | `configurationSet` | no | Configuration set name; added to the policy resources and exposed as `configuration-set`. |
