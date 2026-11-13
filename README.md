@@ -27,14 +27,16 @@ release unless an operator pins a specific version via
 - `aws-rds-mysql`
 - `aws-cloudtrail-security-alerts` (CloudTrail metric filters + alarms
   for SOC2 CC6.1 / CC7.1, ISO 27001 A.8.2 / A.8.15 / A.8.16)
+- `aws-ses-smtp-user` (Amazon SES SMTP credentials; see
+  [below](#ses-smtp-credentials-aws-ses-smtp-user))
 
 **Templates:**
 - `ecs-fargate` (cloud-compose)
 - `aws-lambda` (single-image)
 - `aws-static-website` (static-site)
 
-**ComputeProcessors:** `s3-bucket`, `aws-rds-postgres`, `aws-rds-mysql`
-— emit `<PREFIX>_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_URI` /
+**ComputeProcessors:** `s3-bucket`, `aws-rds-postgres`, `aws-rds-mysql`,
+`aws-ses-smtp-user` — emit `<PREFIX>_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_URI` /
 `_DB` env vars + resource tpl extensions to consuming compose/k3s
 stacks via the Phase 1e proto ComputeProcess v2.
 
@@ -60,6 +62,7 @@ sc-plugin-aws/
 │   ├── aws.go                         ← TemplateConfig, CloudExtras, SecurityGroup, SecretsBundle
 │   ├── auth.go                        ← AccountConfig, state/secrets provider configs
 │   ├── bucket.go / ecr_repository.go / rds_postgres.go / rds_mysql.go / aws_lambda.go
+│   ├── ses_smtp_user.go
 │   ├── ecs_fargate.go / static_website.go / cloudtrail_security_alerts.go
 │   └── go.mod                         ← depends only on simple-container-com/api
 └── plugin/                            ← driver tier. Own Go module; the plugin binary.
@@ -69,6 +72,7 @@ sc-plugin-aws/
     ├── internal/                      ← lifted Pulumi driver code (ex pkg/clouds/pulumi/aws)
     │   ├── provider.go / bucket.go / aws_lambda.go / ecs_fargate.go / ...
     │   ├── compute_proc.go            ← S3 + RDS compute processors
+    │   ├── ses_smtp_user.go           ← SES SMTP user + its compute processor
     │   └── helpers/                   ← CloudWatch-alert / Health-bridge Lambda handlers
     └── go.mod                         ← pulumi-aws + pulumi-awsx + aws-sdk-go-v2/cloudtrail
                                          + aws-sdk-go-v2/cloudwatchlogs + aws-lambda-go
@@ -252,3 +256,99 @@ stopping and the new one passing health checks.
 
 Like `containerSecrets`, this travels in the raw `stackConfig.cloudExtras`
 block, so it needs only this plugin release, not a new SC core.
+
+## SES SMTP credentials (`aws-ses-smtp-user`)
+
+Declared in a parent stack's `server.yaml`, `aws-ses-smtp-user` creates:
+
+- an IAM user dedicated to SES sending;
+- an inline policy allowing only `ses:SendRawEmail` (the one action the SES
+  SMTP interface uses) on the listed SES identities, plus the configuration
+  set if one is given, optionally restricted by a `ses:FromAddress`
+  `StringLike` condition;
+- an access key, whose secret is converted into the SES SMTP password
+  (SigV4, region-specific).
+
+It does **not** manage SES identities, DKIM or DNS: verify the domain and get
+production access out of band first.
+
+```yaml
+# .sc/stacks/<parent>/server.yaml
+plugins:
+  aws:
+    source:
+      type: github-release
+      repository: simple-container-com/sc-plugin-aws
+      version: <a release that includes aws-ses-smtp-user>
+
+resources:
+  resources:
+    prod:
+      resources:
+        mautic-ses:
+          type: aws-ses-smtp-user
+          config:
+            credentials: "${auth:aws}"
+            account: "${auth:aws.projectId}"
+            region: eu-central-1         # SES region; defaults to the credentials' region
+            identities:                  # verified domains / addresses, or full identity ARNs
+              - innmind.com
+            # configurationSet: mautic   # optional; also allowed in the policy
+            # fromAddresses:             # optional ses:FromAddress allowlist
+            #   - "*@innmind.com"
+```
+
+| Config | Required | Meaning |
+| --- | --- | --- |
+| `identities` | yes | SES identities the user may send as. A bare name becomes `arn:aws:ses:<region>:<account>:identity/<name>`; values starting with `arn:` are used as-is. |
+| `region` | no | SES region of the SMTP endpoint and password. Defaults to the region of the `${auth:...}` credentials. |
+| `account` | no | Account ID for the identity ARNs. Defaults to the credentials' account, else `sts:GetCallerIdentity`. |
+| `configurationSet` | no | Configuration set name; added to the policy resources and exposed as `configuration-set`. |
+| `fromAddresses` | no | `ses:FromAddress` patterns (`StringLike`, wildcards allowed). |
+| `name` | no | Base name of the IAM resources (defaults to the resource name). |
+
+The parent stack exports `<name>--<env>-ses-smtp-username`,
+`-ses-smtp-password` (**secret** in Pulumi state), `-ses-smtp-host`
+(`email-smtp.<region>.amazonaws.com`), `-ses-smtp-port` (`587`, STARTTLS),
+`-ses-region` and `-ses-iam-user`. When `region` matches the provider's
+region the password is the provider's `aws.iam.AccessKey.sesSmtpPasswordV4`;
+otherwise the plugin derives it for `region` with the same documented
+algorithm.
+
+A consuming stack reads them through `uses:` exactly like an `s3-bucket`:
+
+```yaml
+# .sc/stacks/mautic-innmind/client.yaml
+stacks:
+  prod:
+    type: cloud-compose
+    parent: alphamind-co/alphamind-co
+    config:
+      uses: [mautic-ses]
+      env:
+        MAUTIC_MAILER_HOST: ${resource:mautic-ses.smtp-host}
+        MAUTIC_MAILER_PORT: ${resource:mautic-ses.smtp-port}
+      secrets:
+        MAUTIC_MAILER_USER: ${resource:mautic-ses.smtp-user}
+        MAUTIC_MAILER_PASSWORD: ${resource:mautic-ses.smtp-password}
+```
+
+`${resource:<name>.…}` keys: `smtp-user`, `smtp-password`, `smtp-host`,
+`smtp-port`, `region`, and `configuration-set` when configured. Put
+`smtp-user` / `smtp-password` under `secrets:`, not `env:`: SC resolves the
+placeholder in either section, and only `secrets:` stores the value as a
+secret. The processor also injects `SMTP_<NAME>_HOST` / `_PORT` / `_USER` /
+`_PASSWORD`, `SES_<NAME>_REGION` and unscoped `SMTP_HOST` / `SMTP_PORT` /
+`SMTP_USER` / `SMTP_PASSWORD` / `SES_REGION` (never overriding an existing
+value), where `<NAME>` is the env-suffixed resource name (`MAUTIC_SES__PROD`);
+`_USER` and `_PASSWORD` are injected as secrets.
+
+SC core discovers the type from this plugin's `Schema`, so no core change is
+needed, but the parent stack must pin `plugins.aws` to a release that has it:
+SC's auto-injection only recognises its built-in list of AWS types and
+reports `unknown type "aws-ses-smtp-user"` without an explicit `plugins.aws`
+block.
+
+The access key is created once and is not rotated automatically. Rotating it
+means replacing the `…-ses-smtp-access-key` resource in the parent stack and
+then redeploying every consumer.
