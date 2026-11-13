@@ -301,11 +301,16 @@ resources:
 | Config | Required | Meaning |
 | --- | --- | --- |
 | `identities` | yes | SES identities the user may send as. A bare name becomes `arn:aws:ses:<region>:<account>:identity/<name>`; values starting with `arn:` are used as-is. |
-| `region` | no | SES region of the SMTP endpoint and password. Defaults to the region of the `${auth:...}` credentials. |
+| `region` | no | SES region of the SMTP endpoint and password. Defaults to the region of the `${auth:...}` credentials. Must be a region with an [SES SMTP endpoint](https://docs.aws.amazon.com/general/latest/gr/ses.html#ses_smtp_endpoints) (e.g. not `af-south-1`, `il-central-1`, `eu-south-1`); otherwise provisioning fails before any IAM resource is created. |
 | `account` | no | Account ID for the identity ARNs. Defaults to the credentials' account, else `sts:GetCallerIdentity`. |
 | `configurationSet` | no | Configuration set name; added to the policy resources and exposed as `configuration-set`. |
 | `fromAddresses` | no | `ses:FromAddress` patterns (`StringLike`, wildcards allowed). |
 | `name` | no | Base name of the IAM resources (defaults to the resource name). |
+
+The resource name (or `name`) must use only lowercase letters, digits and
+hyphens. SC derives env var names by upper-casing and mapping `-`, `_` and
+camelCase onto `_`, so `mail-a` and `mail_a` would otherwise share
+`SMTP_MAIL_A__<ENV>_*`, and SC silently keeps only the first value.
 
 The parent stack exports `<name>--<env>-ses-smtp-username`,
 `-ses-smtp-password` (**secret** in Pulumi state), `-ses-smtp-host`
@@ -338,10 +343,14 @@ stacks:
 `smtp-user` / `smtp-password` under `secrets:`, not `env:`: SC resolves the
 placeholder in either section, and only `secrets:` stores the value as a
 secret. The processor also injects `SMTP_<NAME>_HOST` / `_PORT` / `_USER` /
-`_PASSWORD`, `SES_<NAME>_REGION` and unscoped `SMTP_HOST` / `SMTP_PORT` /
-`SMTP_USER` / `SMTP_PASSWORD` / `SES_REGION` (never overriding an existing
-value), where `<NAME>` is the env-suffixed resource name (`MAUTIC_SES__PROD`);
-`_USER` and `_PASSWORD` are injected as secrets.
+`_PASSWORD` and `SES_<NAME>_REGION`, where `<NAME>` is the env-suffixed
+resource name (`MAUTIC_SES__PROD`); `_USER` and `_PASSWORD` are injected as
+secrets. There are no unscoped `SMTP_HOST` / `SMTP_PASSWORD` / `SES_REGION`
+vars, so a client using two SES resources never gets credentials from an
+arbitrary one: map the ones you need explicitly with `${resource:…}`.
+
+Only `uses:` is supported. Listing the resource under `dependencies:` fails
+with an explicit error, as for `aws-rds-postgres` / `aws-rds-mysql`.
 
 SC core discovers the type from this plugin's `Schema`, so no core change is
 needed, but the parent stack must pin `plugins.aws` to a release that has it:

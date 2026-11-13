@@ -43,3 +43,26 @@ func TestSesSmtpUserValidate(t *testing.T) {
 		To(MatchError(ContainSubstring("fromAddresses[0]")))
 	Expect((&SesSmtpUser{Identities: []string{"innmind.com", "arn:aws:ses:eu-central-1:645119433725:identity/x.com"}}).Validate()).To(Succeed())
 }
+
+func TestValidateSesSmtpRegion(t *testing.T) {
+	RegisterTestingT(t)
+
+	for _, region := range []string{"eu-central-1", "us-east-1", "us-gov-west-1", "ap-northeast-3"} {
+		Expect(ValidateSesSmtpRegion(region)).To(Succeed(), region)
+	}
+	// SES regions without an SMTP endpoint, plus non-SES / malformed values.
+	for _, region := range []string{"af-south-1", "il-central-1", "eu-south-1", "ca-west-1", "me-south-1", "eu-central-3", "", "EU-CENTRAL-1"} {
+		Expect(ValidateSesSmtpRegion(region)).To(MatchError(ContainSubstring("has no Amazon SES SMTP endpoint")), region)
+	}
+}
+
+func TestValidateSesSmtpUserName(t *testing.T) {
+	RegisterTestingT(t)
+
+	for _, name := range []string{"mautic-ses", "mail-a", "a", "ses2"} {
+		Expect(ValidateSesSmtpUserName(name)).To(Succeed(), name)
+	}
+	for _, name := range []string{"mail_a", "mailA", "MAIL-A", "-mail", "mail-", "mail.a", ""} {
+		Expect(ValidateSesSmtpUserName(name)).To(MatchError(ContainSubstring("lowercase letters, digits and hyphens")), name)
+	}
+}

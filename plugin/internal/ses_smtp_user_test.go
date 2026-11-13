@@ -98,26 +98,15 @@ func TestSesSmtpEnvVariablesAndTplExtension(t *testing.T) {
 	for _, v := range vars {
 		got[v.name] = v
 	}
-	for name, want := range map[string]struct {
-		value  string
-		secret bool
-	}{
-		"SMTP_MAUTIC_SES__PROD_HOST":     {"email-smtp.eu-central-1.amazonaws.com", false},
-		"SMTP_MAUTIC_SES__PROD_PORT":     {"587", false},
-		"SMTP_MAUTIC_SES__PROD_USER":     {"AKIAEXAMPLE", true},
-		"SMTP_MAUTIC_SES__PROD_PASSWORD": {"pw", true},
-		"SMTP_HOST":                      {"email-smtp.eu-central-1.amazonaws.com", false},
-		"SMTP_PORT":                      {"587", false},
-		"SMTP_USER":                      {"AKIAEXAMPLE", true},
-		"SMTP_PASSWORD":                  {"pw", true},
-		"SES_MAUTIC_SES__PROD_REGION":    {"eu-central-1", false},
-		"SES_REGION":                     {"eu-central-1", false},
-	} {
-		require.Contains(t, got, name)
-		require.Equal(t, want.value, got[name].value, name)
-		require.Equal(t, want.secret, got[name].secret, name)
-	}
-	require.Len(t, vars, 10)
+	// Only resource-scoped names: no unscoped SMTP_* / SES_REGION.
+	require.Equal(t, map[string]sesSmtpEnvVariable{
+		"SMTP_MAUTIC_SES__PROD_HOST":     {"SMTP_MAUTIC_SES__PROD_HOST", "email-smtp.eu-central-1.amazonaws.com", false},
+		"SMTP_MAUTIC_SES__PROD_PORT":     {"SMTP_MAUTIC_SES__PROD_PORT", "587", false},
+		"SMTP_MAUTIC_SES__PROD_USER":     {"SMTP_MAUTIC_SES__PROD_USER", "AKIAEXAMPLE", true},
+		"SMTP_MAUTIC_SES__PROD_PASSWORD": {"SMTP_MAUTIC_SES__PROD_PASSWORD", "pw", true},
+		"SES_MAUTIC_SES__PROD_REGION":    {"SES_MAUTIC_SES__PROD_REGION", "eu-central-1", false},
+	}, got)
+	require.Len(t, vars, 5)
 
 	ext := sesSmtpTplExtension(&aws.SesSmtpUser{}, "h", "587", "u", "p", "r")
 	require.Equal(t, map[string]string{"smtp-user": "u", "smtp-password": "p", "smtp-host": "h", "smtp-port": "587", "region": "r"}, ext)
@@ -244,20 +233,31 @@ func TestSesSmtpUser_RegionDiffersFromProvider(t *testing.T) {
 		"arn:aws:ses:us-west-1:999999999999:identity/innmind.com")
 }
 
-func TestSesSmtpUser_RejectsInvalidConfig(t *testing.T) {
-	for name, cfg := range map[string]*aws.SesSmtpUser{
-		"no identities": {AccountConfig: aws.AccountConfig{Region: "eu-central-1"}},
-		"no region":     {Identities: []string{"innmind.com"}},
+func TestSesSmtpUser_RejectsInvalidConfigBeforeCreatingResources(t *testing.T) {
+	creds := api.Credentials{Credentials: `{"region":"eu-central-1"}`}
+	for name, tc := range map[string]struct {
+		cfg     *aws.SesSmtpUser
+		wantErr string
+	}{
+		"no identities": {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Region: "eu-central-1"}}, "identities"},
+		"no region":     {&aws.SesSmtpUser{Identities: []string{"innmind.com"}}, "region"},
+		// af-south-1 is an SES region, but has no SMTP endpoint.
+		"region without smtp endpoint":             {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Region: "af-south-1", Credentials: creds}, Identities: []string{"innmind.com"}}, `region "af-south-1" has no Amazon SES SMTP endpoint`},
+		"credentials region without smtp endpoint": {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Credentials: api.Credentials{Credentials: `{"region":"il-central-1"}`}}, Identities: []string{"innmind.com"}}, `"il-central-1"`},
+		"name with underscore":                     {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Credentials: creds}, Name: "mail_a", Identities: []string{"innmind.com"}}, `name "mail_a"`},
+		"name with uppercase":                      {&aws.SesSmtpUser{AccountConfig: aws.AccountConfig{Credentials: creds}, Name: "mailA", Identities: []string{"innmind.com"}}, `name "mailA"`},
 	} {
 		t.Run(name, func(t *testing.T) {
+			mocks := &sesMocks{}
 			err := sdk.RunErr(func(ctx *sdk.Context) error {
 				_, err := SesSmtpUser(ctx, api.Stack{Name: "s"}, api.ResourceInput{
-					Descriptor:  &api.ResourceDescriptor{Type: aws.ResourceTypeSesSmtpUser, Name: "mautic-ses", Config: api.Config{Config: cfg}},
+					Descriptor:  &api.ResourceDescriptor{Type: aws.ResourceTypeSesSmtpUser, Name: "mautic-ses", Config: api.Config{Config: tc.cfg}},
 					StackParams: &api.StackParams{StackName: "s", Environment: "prod"},
 				}, pApi.ProvisionParams{Log: logger.New()})
 				return err
-			}, sdk.WithMocks("project", "stack", &sesMocks{}))
-			require.Error(t, err)
+			}, sdk.WithMocks("project", "stack", mocks))
+			require.ErrorContains(t, err, tc.wantErr)
+			require.Empty(t, mocks.resources, "no IAM resource may be created for an invalid config")
 		})
 	}
 }
@@ -286,65 +286,84 @@ func (m *sesParentMocks) NewResource(args sdk.MockResourceArgs) (string, resourc
 	return args.Name + "-id", out, nil
 }
 
-// tplCollector records emitted env vars and tpl extensions on top of the
-// plugin runtime collector.
-type tplCollector struct {
-	*runtime.Collector
-	mu     sync.Mutex
-	tpl    map[string]map[string]string
-	env    map[string]string
-	secret map[string]string
-}
-
-func (c *tplCollector) AddEnvVariableIfNotExist(name, value, _, _, _ string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.env[name] = value
-}
-
-func (c *tplCollector) AddSecretEnvVariableIfNotExist(name, value, _, _, _ string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.secret[name] = value
-}
-
-func (c *tplCollector) AddResourceTplExtension(resName string, values map[string]string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.tpl[resName] = values
-}
-
-func TestSesSmtpUserComputeProcessor_EmitsSecretsAndTplExtension(t *testing.T) {
-	prefix := "mautic-ses--prod-ses-"
-	mocks := &sesParentMocks{
-		outputs: map[string]string{
-			prefix + "smtp-username": "AKIAEXAMPLE",
-			prefix + "smtp-password": "BMXhUYlu5Z3gSXVQORxlVa7XPaz91aGWdfHxvkOZdWZ2",
-			prefix + "smtp-host":     "email-smtp.eu-central-1.amazonaws.com",
-			prefix + "smtp-port":     "587",
-			prefix + "region":        "eu-central-1",
-		},
-		secret: []string{prefix + "smtp-password"},
+// withSesParentOutputs adds the parent exports of one aws-ses-smtp-user.
+func (m *sesParentMocks) withSesParentOutputs(resName, user, password, region string) *sesParentMocks {
+	if m.outputs == nil {
+		m.outputs = map[string]string{}
 	}
-	collector := &tplCollector{
+	prefix := resName + "-ses-"
+	m.outputs[prefix+"smtp-username"] = user
+	m.outputs[prefix+"smtp-password"] = password
+	m.outputs[prefix+"smtp-host"] = sesSmtpHost(region)
+	m.outputs[prefix+"smtp-port"] = "587"
+	m.outputs[prefix+"region"] = region
+	m.secret = append(m.secret, prefix+"smtp-password")
+	return m
+}
+
+// ifNotExistCollector mirrors SC core's consuming-stack collector
+// (pkg/clouds/pulumi/api.Collector): the first value of an env var name wins
+// and later ones are dropped. Drops are recorded so tests can assert none of
+// a resource's credentials were silently shadowed.
+type ifNotExistCollector struct {
+	*runtime.Collector
+	mu      sync.Mutex
+	tpl     map[string]map[string]string
+	env     map[string]string
+	secret  map[string]string
+	dropped []string
+}
+
+func newIfNotExistCollector() *ifNotExistCollector {
+	return &ifNotExistCollector{
 		Collector: &runtime.Collector{},
 		tpl:       map[string]map[string]string{},
 		env:       map[string]string{},
 		secret:    map[string]string{},
 	}
+}
+
+func (c *ifNotExistCollector) add(target map[string]string, name, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, inEnv := c.env[name]
+	_, inSecret := c.secret[name]
+	if inEnv || inSecret {
+		c.dropped = append(c.dropped, name)
+		return
+	}
+	target[name] = value
+}
+
+func (c *ifNotExistCollector) AddEnvVariableIfNotExist(name, value, _, _, _ string) {
+	c.add(c.env, name, value)
+}
+
+func (c *ifNotExistCollector) AddSecretEnvVariableIfNotExist(name, value, _, _, _ string) {
+	c.add(c.secret, name, value)
+}
+
+func (c *ifNotExistCollector) AddResourceTplExtension(resName string, values map[string]string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tpl[resName] = values
+}
+
+var sesTestParent = pApi.ParentInfo{StackName: "alphamind-co", FullReference: "organization/alphamind-co/alphamind-co--prod", UsesResource: true}
+
+func runSesCompute(ctx *sdk.Context, collector pApi.ComputeContextCollector, parent pApi.ParentInfo, resName string, cfg *aws.SesSmtpUser) error {
+	_, err := SesSmtpUserComputeProcessor(ctx, api.Stack{Name: "mautic-innmind"}, api.ResourceInput{
+		Descriptor:  &api.ResourceDescriptor{Type: aws.ResourceTypeSesSmtpUser, Name: resName, Config: api.Config{Config: cfg}},
+		StackParams: &api.StackParams{StackName: "mautic-innmind", Environment: "prod"},
+	}, collector, pApi.ProvisionParams{Log: logger.New(), ParentStack: &parent})
+	return err
+}
+
+func TestSesSmtpUserComputeProcessor_EmitsSecretsAndTplExtension(t *testing.T) {
+	mocks := (&sesParentMocks{}).withSesParentOutputs("mautic-ses--prod", "AKIAEXAMPLE", "BMXhUYlu5Z3gSXVQORxlVa7XPaz91aGWdfHxvkOZdWZ2", "eu-central-1")
+	collector := newIfNotExistCollector()
 	err := sdk.RunErr(func(ctx *sdk.Context) error {
-		_, err := SesSmtpUserComputeProcessor(ctx, api.Stack{Name: "mautic-innmind"}, api.ResourceInput{
-			Descriptor: &api.ResourceDescriptor{
-				Type:   aws.ResourceTypeSesSmtpUser,
-				Name:   "mautic-ses",
-				Config: api.Config{Config: &aws.SesSmtpUser{Identities: []string{"innmind.com"}, ConfigurationSet: "mautic"}},
-			},
-			StackParams: &api.StackParams{StackName: "mautic-innmind", Environment: "prod"},
-		}, collector, pApi.ProvisionParams{
-			Log:         logger.New(),
-			ParentStack: &pApi.ParentInfo{StackName: "alphamind-co", FullReference: "organization/alphamind-co/alphamind-co--prod", UsesResource: true},
-		})
-		return err
+		return runSesCompute(ctx, collector, sesTestParent, "mautic-ses", &aws.SesSmtpUser{Identities: []string{"innmind.com"}, ConfigurationSet: "mautic"})
 	}, sdk.WithMocks("project", "stack", mocks))
 	require.NoError(t, err)
 
@@ -357,27 +376,87 @@ func TestSesSmtpUserComputeProcessor_EmitsSecretsAndTplExtension(t *testing.T) {
 		"configuration-set": "mautic",
 	}, collector.tpl["mautic-ses"])
 
-	require.Equal(t, "BMXhUYlu5Z3gSXVQORxlVa7XPaz91aGWdfHxvkOZdWZ2", collector.secret["SMTP_PASSWORD"])
-	require.Equal(t, "AKIAEXAMPLE", collector.secret["SMTP_MAUTIC_SES__PROD_USER"])
-	require.Equal(t, "email-smtp.eu-central-1.amazonaws.com", collector.env["SMTP_HOST"])
-	require.NotContains(t, collector.env, "SMTP_PASSWORD")
+	require.Equal(t, map[string]string{
+		"SMTP_MAUTIC_SES__PROD_USER":     "AKIAEXAMPLE",
+		"SMTP_MAUTIC_SES__PROD_PASSWORD": "BMXhUYlu5Z3gSXVQORxlVa7XPaz91aGWdfHxvkOZdWZ2",
+	}, collector.secret)
+	require.Equal(t, map[string]string{
+		"SMTP_MAUTIC_SES__PROD_HOST":  "email-smtp.eu-central-1.amazonaws.com",
+		"SMTP_MAUTIC_SES__PROD_PORT":  "587",
+		"SES_MAUTIC_SES__PROD_REGION": "eu-central-1",
+	}, collector.env)
+	require.Empty(t, collector.dropped)
+}
+
+// Two SES resources in one client's `uses:` must each keep their own
+// credentials, with nothing shadowed by core's first-wins env semantics.
+func TestSesSmtpUserComputeProcessor_TwoResourcesDoNotShadowEachOther(t *testing.T) {
+	mocks := (&sesParentMocks{}).
+		withSesParentOutputs("mail-a--prod", "AKIAA", "password-a", "eu-central-1").
+		withSesParentOutputs("mail-b--prod", "AKIAB", "password-b", "us-east-1")
+	collector := newIfNotExistCollector()
+	err := sdk.RunErr(func(ctx *sdk.Context) error {
+		if err := runSesCompute(ctx, collector, sesTestParent, "mail-a", &aws.SesSmtpUser{}); err != nil {
+			return err
+		}
+		return runSesCompute(ctx, collector, sesTestParent, "mail-b", &aws.SesSmtpUser{})
+	}, sdk.WithMocks("project", "stack", mocks))
+	require.NoError(t, err)
+
+	require.Empty(t, collector.dropped)
+	require.Equal(t, "password-a", collector.secret["SMTP_MAIL_A__PROD_PASSWORD"])
+	require.Equal(t, "password-b", collector.secret["SMTP_MAIL_B__PROD_PASSWORD"])
+	require.Equal(t, "AKIAA", collector.secret["SMTP_MAIL_A__PROD_USER"])
+	require.Equal(t, "AKIAB", collector.secret["SMTP_MAIL_B__PROD_USER"])
+	require.Equal(t, "email-smtp.us-east-1.amazonaws.com", collector.env["SMTP_MAIL_B__PROD_HOST"])
+	require.Equal(t, "password-a", collector.tpl["mail-a"]["smtp-password"])
+	require.Equal(t, "password-b", collector.tpl["mail-b"]["smtp-password"])
+	for _, unscoped := range []string{"SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SES_REGION"} {
+		require.NotContains(t, collector.env, unscoped)
+		require.NotContains(t, collector.secret, unscoped)
+	}
+}
+
+// `mail_a` would normalize to the same SMTP_MAIL_A__PROD_* names as `mail-a`
+// and be silently shadowed; it is rejected instead.
+func TestSesSmtpUserComputeProcessor_RejectsCollidingName(t *testing.T) {
+	mocks := (&sesParentMocks{}).
+		withSesParentOutputs("mail-a--prod", "AKIAA", "password-a", "eu-central-1").
+		withSesParentOutputs("mail_a--prod", "AKIAB", "password-b", "eu-central-1")
+	collector := newIfNotExistCollector()
+	err := sdk.RunErr(func(ctx *sdk.Context) error {
+		if err := runSesCompute(ctx, collector, sesTestParent, "mail-a", &aws.SesSmtpUser{}); err != nil {
+			return err
+		}
+		return runSesCompute(ctx, collector, sesTestParent, "mail_a", &aws.SesSmtpUser{})
+	}, sdk.WithMocks("project", "stack", mocks))
+	require.ErrorContains(t, err, `name "mail_a"`)
+	require.Empty(t, collector.dropped)
+	require.NotContains(t, collector.tpl, "mail_a")
+}
+
+func TestSesSmtpUserComputeProcessor_RejectsDependencyConsumption(t *testing.T) {
+	mocks := (&sesParentMocks{}).withSesParentOutputs("mautic-ses--prod", "AKIAEXAMPLE", "pw", "eu-central-1")
+	parent := sesTestParent
+	parent.UsesResource = false
+	parent.DependsOnResource = &api.StackConfigDependencyResource{Name: "mailer", Owner: "alphamind-co/alphamind-co", Resource: "mautic-ses"}
+	collector := newIfNotExistCollector()
+	err := sdk.RunErr(func(ctx *sdk.Context) error {
+		return runSesCompute(ctx, collector, parent, "mautic-ses", &aws.SesSmtpUser{})
+	}, sdk.WithMocks("project", "stack", mocks))
+	require.ErrorContains(t, err, "only supports `uses`")
+	require.Empty(t, collector.tpl)
+	require.Empty(t, collector.env)
+	require.Empty(t, collector.secret)
 }
 
 func TestSesSmtpUserComputeProcessor_PasswordMustBeSecretInParent(t *testing.T) {
-	prefix := "mautic-ses--prod-ses-"
 	mocks := &sesParentMocks{outputs: map[string]string{
-		prefix + "smtp-username": "AKIAEXAMPLE",
-		prefix + "smtp-password": "plaintext",
+		"mautic-ses--prod-ses-smtp-username": "AKIAEXAMPLE",
+		"mautic-ses--prod-ses-smtp-password": "plaintext",
 	}}
 	err := sdk.RunErr(func(ctx *sdk.Context) error {
-		_, err := SesSmtpUserComputeProcessor(ctx, api.Stack{Name: "mautic-innmind"}, api.ResourceInput{
-			Descriptor:  &api.ResourceDescriptor{Type: aws.ResourceTypeSesSmtpUser, Name: "mautic-ses", Config: api.Config{Config: &aws.SesSmtpUser{}}},
-			StackParams: &api.StackParams{StackName: "mautic-innmind", Environment: "prod"},
-		}, &runtime.Collector{}, pApi.ProvisionParams{
-			Log:         logger.New(),
-			ParentStack: &pApi.ParentInfo{StackName: "alphamind-co", FullReference: "organization/alphamind-co/alphamind-co--prod"},
-		})
-		return err
+		return runSesCompute(ctx, newIfNotExistCollector(), sesTestParent, "mautic-ses", &aws.SesSmtpUser{})
 	}, sdk.WithMocks("project", "stack", mocks))
 	require.ErrorContains(t, err, "smtp-password")
 }

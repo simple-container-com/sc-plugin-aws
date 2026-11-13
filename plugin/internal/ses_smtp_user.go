@@ -48,7 +48,11 @@ func SesSmtpUser(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, par
 		return nil, err
 	}
 
-	resName := input.ToResName(lo.If(cfg.Name == "", input.Descriptor.Name).Else(cfg.Name))
+	baseName := lo.If(cfg.Name == "", input.Descriptor.Name).Else(cfg.Name)
+	if err := aws.ValidateSesSmtpUserName(baseName); err != nil {
+		return nil, err
+	}
+	resName := input.ToResName(baseName)
 	creds, err := sesCredentialsAccount(cfg)
 	if err != nil {
 		return nil, err
@@ -56,6 +60,11 @@ func SesSmtpUser(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, par
 	region := lo.If(cfg.Region != "", cfg.Region).Else(creds.Region)
 	if region == "" {
 		return nil, errors.Errorf("%s %q: `region` is not set and the aws credentials carry no region", aws.ResourceTypeSesSmtpUser, input.Descriptor.Name)
+	}
+	// Fail before creating IAM resources: an SMTP password and host for a
+	// region without an SMTP endpoint would be unusable.
+	if err := aws.ValidateSesSmtpRegion(region); err != nil {
+		return nil, err
 	}
 	params.Log.Info(ctx.Context(), "configure ses smtp user %q (region %q, identities %v)", resName, region, cfg.Identities)
 
@@ -136,7 +145,18 @@ func SesSmtpUserComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Re
 	if !ok {
 		return nil, errors.Errorf("failed to convert ses smtp user config for %q", input.Descriptor.Type)
 	}
-	resName := input.ToResName(lo.If(cfg.Name == "", input.Descriptor.Name).Else(cfg.Name))
+	// Like the RDS processors, only `uses:` is supported: consuming the
+	// credentials as a `dependencies:` entry is rejected explicitly rather
+	// than handed out under the dependency's name.
+	if !params.ParentStack.UsesResource {
+		return nil, errors.Errorf("%s %q only supports `uses`, but it wasn't explicitly declared as being used by %q",
+			aws.ResourceTypeSesSmtpUser, input.Descriptor.Name, stack.Name)
+	}
+	baseName := lo.If(cfg.Name == "", input.Descriptor.Name).Else(cfg.Name)
+	if err := aws.ValidateSesSmtpUserName(baseName); err != nil {
+		return nil, err
+	}
+	resName := input.ToResName(baseName)
 
 	suffix := lo.If(params.ParentStack.DependsOnResource != nil, "--"+lo.FromPtr(params.ParentStack.DependsOnResource).Name).Else("")
 	params.Log.Info(ctx.Context(), "getting parent's (%q) outputs for ses smtp user %q (%q)", params.ParentStack.FullReference, resName, suffix)
@@ -198,25 +218,20 @@ type sesSmtpEnvVariable struct {
 	secret bool
 }
 
-// sesSmtpEnvVariables lists the env vars injected into consumers: a
-// resource-scoped set (SMTP_<RES>_*) and an unscoped set (SMTP_*) that never
-// overrides a value already present.
+// sesSmtpEnvVariables lists the env vars injected into consumers. They are
+// all scoped to the resource (SMTP_<RES>_*, SES_<RES>_REGION). There are
+// deliberately no unscoped SMTP_* / SES_REGION vars: SC keeps the first value
+// of a duplicate env name, so with two SES resources in `uses:` they would
+// silently point at whichever was processed first.
 func sesSmtpEnvVariables(resName, host, port, user, password, region string) []sesSmtpEnvVariable {
-	var res []sesSmtpEnvVariable
-	for _, prefix := range []string{fmt.Sprintf("SMTP_%s_", resName), "SMTP_"} {
-		res = append(
-			res,
-			sesSmtpEnvVariable{util.ToEnvVariableName(prefix + "HOST"), host, false},
-			sesSmtpEnvVariable{util.ToEnvVariableName(prefix + "PORT"), port, false},
-			sesSmtpEnvVariable{util.ToEnvVariableName(prefix + "USER"), user, true},
-			sesSmtpEnvVariable{util.ToEnvVariableName(prefix + "PASSWORD"), password, true},
-		)
+	prefix := fmt.Sprintf("SMTP_%s_", resName)
+	return []sesSmtpEnvVariable{
+		{util.ToEnvVariableName(prefix + "HOST"), host, false},
+		{util.ToEnvVariableName(prefix + "PORT"), port, false},
+		{util.ToEnvVariableName(prefix + "USER"), user, true},
+		{util.ToEnvVariableName(prefix + "PASSWORD"), password, true},
+		{util.ToEnvVariableName(fmt.Sprintf("SES_%s_REGION", resName)), region, false},
 	}
-	return append(
-		res,
-		sesSmtpEnvVariable{util.ToEnvVariableName(fmt.Sprintf("SES_%s_REGION", resName)), region, false},
-		sesSmtpEnvVariable{util.ToEnvVariableName("SES_REGION"), region, false},
-	)
 }
 
 func sesSmtpTplExtension(cfg *aws.SesSmtpUser, host, port, user, password, region string) map[string]string {

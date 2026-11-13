@@ -4,6 +4,8 @@
 package aws
 
 import (
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -59,6 +61,47 @@ func (c *SesSmtpUser) Validate() error {
 		if strings.TrimSpace(from) == "" {
 			return errors.Errorf("%s: `fromAddresses[%d]` is empty", ResourceTypeSesSmtpUser, i)
 		}
+	}
+	return nil
+}
+
+// SesSmtpRegions are the regions with an SES SMTP endpoint
+// (email-smtp.<region>.amazonaws.com), per
+// https://docs.aws.amazon.com/general/latest/gr/ses.html#ses_smtp_endpoints
+// as of 2026-11. SES regions missing here (af-south-1, ap-south-2,
+// ap-southeast-3, ap-southeast-5, ca-west-1, eu-central-2, eu-south-1,
+// il-central-1, me-central-1, me-south-1, ...) have no SMTP endpoint.
+var SesSmtpRegions = []string{
+	"us-east-1", "us-east-2", "us-west-1", "us-west-2",
+	"ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+	"ap-south-1", "ap-southeast-1", "ap-southeast-2",
+	"ca-central-1",
+	"eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3",
+	"sa-east-1",
+	"us-gov-east-1", "us-gov-west-1",
+}
+
+// ValidateSesSmtpRegion fails for a region without an SES SMTP endpoint.
+func ValidateSesSmtpRegion(region string) error {
+	if !slices.Contains(SesSmtpRegions, region) {
+		return errors.Errorf("%s: region %q has no Amazon SES SMTP endpoint; use one of %s (see https://docs.aws.amazon.com/general/latest/gr/ses.html#ses_smtp_endpoints)",
+			ResourceTypeSesSmtpUser, region, strings.Join(SesSmtpRegions, ", "))
+	}
+	return nil
+}
+
+var sesSmtpUserNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// ValidateSesSmtpUserName requires lowercase letters, digits and hyphens in
+// the resource name (or its `name` override). Consumers get the credentials
+// as SMTP_<NAME>_* env vars, and SC upper-cases names and maps `-`/`_` (and
+// camelCase) onto `_`; with this alphabet that mapping is one-to-one, so two
+// resources a client uses can never share env var names (SC keeps the first
+// value of a duplicate name and silently drops the rest).
+func ValidateSesSmtpUserName(name string) error {
+	if !sesSmtpUserNameRe.MatchString(name) {
+		return errors.Errorf("%s: name %q must contain only lowercase letters, digits and hyphens (and start and end with a letter or digit), so its SMTP_<NAME>_* env vars cannot collide with another resource's",
+			ResourceTypeSesSmtpUser, name)
 	}
 	return nil
 }
