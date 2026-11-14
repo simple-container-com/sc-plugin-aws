@@ -11,18 +11,21 @@
 //   - AWS Pulumi provider (`aws:index/provider:Provider`).
 //   - Resources: `s3-bucket`, `ecr-repository`, `aws-rds-postgres`,
 //     `aws-rds-mysql`, `aws-cloudtrail-security-alerts`,
-//     `aws-ses-smtp-user`.
+//     `aws-ses-smtp-user`, `aws-ses-configuration-set`.
 //   - Templates: `ecs-fargate`, `aws-lambda`, `aws-static-website`.
 //   - State backend: `s3-bucket` (via the `aws-token` auth block).
 //   - Pulumi stack-secrets provider: `aws-kms` (KMS key resource +
 //     provider wiring).
 //   - ComputeProcessors for `s3-bucket`, `aws-rds-postgres`,
-//     `aws-rds-mysql`, `aws-ses-smtp-user`. The RDS pair reads the parent-stack
+//     `aws-rds-mysql`, `aws-ses-smtp-user`, `aws-ses-configuration-set`.
+//     The RDS pair reads the parent-stack
 //     endpoint/port/root creds and emits `<PREFIX>_HOST / _PORT /
 //     _USER / _PASSWORD / _URI / _DB` env vars + resource tpl
 //     extensions. S3 emits bucket name + arn + region.
 //     `aws-ses-smtp-user` emits SMTP host / port / user / password +
-//     region.
+//     region (+ API access key pair with `apiAccess`).
+//     `aws-ses-configuration-set` emits configuration set name, SNS
+//     topic ARN + region.
 //   - PreDestroy is a scaffolding stub — no in-tree AWS code consumed
 //     the pre-destroy hook today.
 //
@@ -102,6 +105,7 @@ func (p *awsPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scp
 			awsApi.ResourceTypeRdsMysql,
 			awsApi.ResourceTypeCloudTrailSecurityAlerts,
 			awsApi.ResourceTypeSesSmtpUser,
+			awsApi.ResourceTypeSesConfigurationSet,
 			awsApi.TemplateTypeEcsFargate,
 			awsApi.TemplateTypeAwsLambda,
 			awsApi.TemplateTypeStaticWebsite,
@@ -112,6 +116,7 @@ func (p *awsPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scp
 			awsApi.ResourceTypeRdsPostgres,
 			awsApi.ResourceTypeRdsMysql,
 			awsApi.ResourceTypeSesSmtpUser,
+			awsApi.ResourceTypeSesConfigurationSet,
 		},
 		StateStoreTypes: []string{
 			awsApi.StateStorageTypeS3Bucket,
@@ -215,6 +220,7 @@ var provisionDispatch = map[string]provisionFunc{
 	awsApi.ResourceTypeRdsMysql:                 awsInternal.RdsMysql,
 	awsApi.ResourceTypeCloudTrailSecurityAlerts: awsInternal.CloudTrailSecurityAlerts,
 	awsApi.ResourceTypeSesSmtpUser:              awsInternal.SesSmtpUser,
+	awsApi.ResourceTypeSesConfigurationSet:      awsInternal.SesConfigurationSet,
 	awsApi.TemplateTypeEcsFargate:               awsInternal.EcsFargate,
 	awsApi.TemplateTypeAwsLambda:                awsInternal.Lambda,
 	awsApi.TemplateTypeStaticWebsite:            awsInternal.StaticWebsite,
@@ -375,10 +381,11 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 type computeFunc func(*sdk.Context, api.Stack, api.ResourceInput, pApi.ComputeContextCollector, pApi.ProvisionParams) (*api.ResourceOutput, error)
 
 var computeDispatch = map[string]computeFunc{
-	awsApi.ResourceTypeS3Bucket:    awsInternal.S3BucketComputeProcessor,
-	awsApi.ResourceTypeRdsPostgres: awsInternal.RdsPostgresComputeProcessor,
-	awsApi.ResourceTypeRdsMysql:    awsInternal.RdsMysqlComputeProcessor,
-	awsApi.ResourceTypeSesSmtpUser: awsInternal.SesSmtpUserComputeProcessor,
+	awsApi.ResourceTypeS3Bucket:            awsInternal.S3BucketComputeProcessor,
+	awsApi.ResourceTypeRdsPostgres:         awsInternal.RdsPostgresComputeProcessor,
+	awsApi.ResourceTypeRdsMysql:            awsInternal.RdsMysqlComputeProcessor,
+	awsApi.ResourceTypeSesSmtpUser:         awsInternal.SesSmtpUserComputeProcessor,
+	awsApi.ResourceTypeSesConfigurationSet: awsInternal.SesConfigurationSetComputeProcessor,
 }
 
 func (p *awsPlugin) ComputeProcess(ctx context.Context, req *scpluginv1.ComputeProcessRequest) (resp *scpluginv1.ComputeProcessResponse, err error) {
@@ -730,6 +737,9 @@ func decodeTypedConfig(resourceType string, inputs map[string]*scpluginv1.InputV
 		return cfg, decodeInputsAs(inputs, cfg)
 	case awsApi.ResourceTypeSesSmtpUser:
 		cfg := &awsApi.SesSmtpUser{}
+		return cfg, decodeInputsAs(inputs, cfg)
+	case awsApi.ResourceTypeSesConfigurationSet:
+		cfg := &awsApi.SesConfigurationSet{}
 		return cfg, decodeInputsAs(inputs, cfg)
 	case awsApi.TemplateTypeEcsFargate:
 		// SC core runs ToEcsFargateConfig server-side; the Inputs

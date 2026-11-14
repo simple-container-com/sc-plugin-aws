@@ -29,6 +29,9 @@ release unless an operator pins a specific version via
   for SOC2 CC6.1 / CC7.1, ISO 27001 A.8.2 / A.8.15 / A.8.16)
 - `aws-ses-smtp-user` (Amazon SES SMTP credentials; see
   [below](#ses-smtp-credentials-aws-ses-smtp-user))
+- `aws-ses-configuration-set` (SES configuration set publishing
+  bounce/complaint events to SNS and HTTPS webhooks; see
+  [below](#ses-configuration-set-with-sns-events-aws-ses-configuration-set))
 
 **Templates:**
 - `ecs-fargate` (cloud-compose)
@@ -36,7 +39,7 @@ release unless an operator pins a specific version via
 - `aws-static-website` (static-site)
 
 **ComputeProcessors:** `s3-bucket`, `aws-rds-postgres`, `aws-rds-mysql`,
-`aws-ses-smtp-user` — emit `<PREFIX>_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_URI` /
+`aws-ses-smtp-user`, `aws-ses-configuration-set` — emit `<PREFIX>_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_URI` /
 `_DB` env vars + resource tpl extensions to consuming compose/k3s
 stacks via the Phase 1e proto ComputeProcess v2.
 
@@ -303,8 +306,9 @@ resources:
 | `identities` | yes | SES identities the user may send as. A bare name becomes `arn:aws:ses:<region>:<account>:identity/<name>`; values starting with `arn:` are used as-is. Wildcards (`*`, `?`) are rejected: IAM would treat them as patterns matching every (including future) identity. |
 | `region` | no | SES region of the SMTP endpoint and password. Defaults to the region of the `${auth:...}` credentials. Must be a region with an [SES SMTP endpoint](https://docs.aws.amazon.com/general/latest/gr/ses.html#ses_smtp_endpoints) (e.g. not `af-south-1`, `il-central-1`, `eu-south-1`); otherwise provisioning fails before any IAM resource is created. |
 | `account` | no | Account ID for the identity ARNs. Defaults to the credentials' account, else `sts:GetCallerIdentity`. |
-| `configurationSet` | no | Configuration set name; added to the policy resources and exposed as `configuration-set`. |
+| `configurationSet` | no | Configuration set name; added to the policy resources (SES authorizes a send that uses a configuration set against both the identity and the configuration set ARN) and exposed as `configuration-set`. Letters, digits, `-` and `_` only (no wildcards). For a set created by [`aws-ses-configuration-set`](#ses-configuration-set-with-sns-events-aws-ses-configuration-set) this is its full name, `<name>--<env>`. |
 | `fromAddresses` | no | `ses:FromAddress` patterns (`StringLike`, wildcards allowed). |
+| `apiAccess` | no | Default `false`. When `true`, the policy also allows `ses:SendEmail` (the SES v2 API) on the same resources and under the same `ses:FromAddress` condition, plus `ses:GetAccount` on `*` in a separate statement (it supports no resource scoping); the access key pair is exported as `access-key` / `secret-key`. |
 | `name` | no | Base name of the IAM resources (defaults to the resource name). |
 
 The resource name (or `name`) must use only lowercase letters, digits and
@@ -315,7 +319,8 @@ camelCase onto `_`, so `mail-a` and `mail_a` would otherwise share
 The parent stack exports `<name>--<env>-ses-smtp-username`,
 `-ses-smtp-password` (**secret** in Pulumi state), `-ses-smtp-host`
 (`email-smtp.<region>.amazonaws.com`), `-ses-smtp-port` (`587`, STARTTLS),
-`-ses-region` and `-ses-iam-user`. When `region` matches the provider's
+`-ses-region` and `-ses-iam-user`, plus `-ses-api-access-key` and
+`-ses-api-secret-key` (**secret**) with `apiAccess`. When `region` matches the provider's
 region the password is the provider's `aws.iam.AccessKey.sesSmtpPasswordV4`;
 otherwise the plugin derives it for `region` with the same documented
 algorithm.
@@ -339,13 +344,16 @@ stacks:
 ```
 
 `${resource:<name>.…}` keys: `smtp-user`, `smtp-password`, `smtp-host`,
-`smtp-port`, `region`, and `configuration-set` when configured. Put
-`smtp-user` / `smtp-password` under `secrets:`, not `env:`: SC resolves the
+`smtp-port`, `region`, `configuration-set` when configured, and
+`access-key` / `secret-key` with `apiAccess`. Put
+`smtp-user` / `smtp-password` / `access-key` / `secret-key` under
+`secrets:`, not `env:`: SC resolves the
 placeholder in either section, and only `secrets:` stores the value as a
 secret. The processor also injects `SMTP_<NAME>_HOST` / `_PORT` / `_USER` /
-`_PASSWORD` and `SES_<NAME>_REGION`, where `<NAME>` is the env-suffixed
-resource name (`MAUTIC_SES__PROD`); `_USER` and `_PASSWORD` are injected as
-secrets. There are no unscoped `SMTP_HOST` / `SMTP_PASSWORD` / `SES_REGION`
+`_PASSWORD` and `SES_<NAME>_REGION` (plus `SES_<NAME>_ACCESS_KEY` /
+`_SECRET_KEY` with `apiAccess`), where `<NAME>` is the env-suffixed
+resource name (`MAUTIC_SES__PROD`); `_USER`, `_PASSWORD`, `_ACCESS_KEY` and
+`_SECRET_KEY` are injected as secrets. There are no unscoped `SMTP_HOST` / `SMTP_PASSWORD` / `SES_REGION`
 vars, so a client using two SES resources never gets credentials from an
 arbitrary one: map the ones you need explicitly with `${resource:…}`.
 
@@ -361,3 +369,99 @@ block.
 The access key is created once and is not rotated automatically. Rotating it
 means replacing the `…-ses-smtp-access-key` resource in the parent stack and
 then redeploying every consumer.
+
+## SES configuration set with SNS events (`aws-ses-configuration-set`)
+
+Declared in a parent stack's `server.yaml`, `aws-ses-configuration-set`
+creates, in the SES region:
+
+- an SES v2 configuration set named `<name>--<env>`, where `<name>` is the
+  resource name or its `name` override (e.g. `mautic-ses-events--prod`);
+- an SNS topic, with a topic policy that lets only `ses.amazonaws.com`
+  `sns:Publish`, and only with `AWS:SourceAccount` = this account and
+  `AWS:SourceArn` = `arn:aws:ses:<region>:<account>:configuration-set/<name>--<env>`;
+- an enabled event destination on the configuration set publishing the
+  configured `events` to the topic;
+- an `https` subscription per `httpsEndpoints` entry, created with
+  `endpointAutoConfirms: true` and a 5-minute confirmation timeout: the
+  endpoint must confirm the subscription itself (fetch the `SubscribeURL`
+  of the `SubscriptionConfirmation` SNS POSTs), or provisioning fails.
+
+Pair it with an `aws-ses-smtp-user` whose `configurationSet` is the
+configuration set's full name. The name is static and deterministic, so the
+SMTP user references it as a plain string:
+
+```yaml
+# .sc/stacks/<parent>/server.yaml
+resources:
+  resources:
+    prod:
+      resources:
+        mautic-ses-events:
+          type: aws-ses-configuration-set
+          config:
+            credentials: "${auth:aws}"
+            account: "${auth:aws.projectId}"
+            region: eu-central-1
+            # events: [BOUNCE, COMPLAINT]     # default
+            httpsEndpoints:
+              - https://mautic.alphamind.co/mailer/callback
+        mautic-ses:
+          type: aws-ses-smtp-user
+          config:
+            credentials: "${auth:aws}"
+            account: "${auth:aws.projectId}"
+            region: eu-central-1
+            identities: [innmind.com]
+            fromAddresses: ["*@innmind.com"]
+            configurationSet: mautic-ses-events--prod   # <resource name>--<env> of the set above
+            apiAccess: true
+```
+
+| Config | Required | Meaning |
+| --- | --- | --- |
+| `region` | no | SES region of the configuration set and SNS topic. Defaults to the region of the `${auth:...}` credentials; a different region gets its own provider. Same allowlist as `aws-ses-smtp-user` (regions with an SES SMTP endpoint), checked before anything is created. |
+| `account` | no | Account ID used in the topic policy conditions. Defaults to the credentials' account, else `sts:GetCallerIdentity`. |
+| `name` | no | Base name (defaults to the resource name). The configuration set is `<name>--<env>`, at most 64 characters. Lowercase letters, digits and hyphens, as for `aws-ses-smtp-user`. |
+| `events` | no | SES event types to publish. Default `[BOUNCE, COMPLAINT]`. Any of `SEND`, `REJECT`, `BOUNCE`, `COMPLAINT`, `DELIVERY`, `OPEN`, `CLICK`, `RENDERING_FAILURE`, `DELIVERY_DELAY`, `SUBSCRIPTION` (upper case, no duplicates). |
+| `httpsEndpoints` | no | `https://` URLs subscribed to the topic. May be empty. |
+
+The parent stack exports `<name>--<env>-ses-configuration-set`,
+`-ses-events-topic-arn` and `-ses-configuration-set-region`. A consuming
+stack reads them through `uses:`:
+
+```yaml
+# .sc/stacks/mautic-innmind/client.yaml
+stacks:
+  prod:
+    type: cloud-compose
+    parent: alphamind-co/alphamind-co
+    config:
+      uses: [mautic-ses, mautic-ses-events]
+      env:
+        MAUTIC_SES_REGION: ${resource:mautic-ses-events.region}
+        MAUTIC_SES_SNS_TOPIC_ARN: ${resource:mautic-ses-events.sns-topic-arn}
+        MAUTIC_SES_CONFIGURATION_SET: ${resource:mautic-ses-events.configuration-set}
+      secrets:
+        MAUTIC_SES_ACCESS_KEY: ${resource:mautic-ses.access-key}
+        MAUTIC_SES_SECRET_KEY: ${resource:mautic-ses.secret-key}
+```
+
+`${resource:<name>.…}` keys: `configuration-set`, `sns-topic-arn`, `region`.
+The processor also injects `SES_<NAME>_CONFIGURATION_SET`,
+`SES_<NAME>_SNS_TOPIC_ARN` and `SES_<NAME>_REGION` (none secret). Only
+`uses:` is supported, as for `aws-ses-smtp-user`. Don't give an
+`aws-ses-smtp-user` and an `aws-ses-configuration-set` the same `name`:
+both would inject `SES_<NAME>_REGION`.
+
+An endpoint that verifies the SNS topic (e.g. the Mautic Amazon SES plugin,
+DSN `mautic+ses+api://KEY:SECRET@default?region=…&sns_topic_arn=…`) can only
+confirm its subscription once it knows the topic ARN. Deploy in two steps:
+
+1. Provision the parent with `httpsEndpoints` empty (or omitted), then
+   deploy the consumer so it has the topic ARN and is ready to confirm.
+2. Add the endpoint to `httpsEndpoints` and provision the parent again; the
+   subscription is confirmed by the endpoint within the timeout.
+
+The topic is not encrypted with KMS: SES cannot publish to a topic encrypted
+with the AWS-managed `alias/aws/sns` key.

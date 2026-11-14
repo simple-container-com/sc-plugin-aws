@@ -93,7 +93,7 @@ func TestSesSmtpUserPolicy_Partition(t *testing.T) {
 }
 
 func TestSesSmtpEnvVariablesAndTplExtension(t *testing.T) {
-	vars := sesSmtpEnvVariables("mautic-ses--prod", "email-smtp.eu-central-1.amazonaws.com", "587", "AKIAEXAMPLE", "pw", "eu-central-1")
+	vars := sesSmtpEnvVariables("mautic-ses--prod", "email-smtp.eu-central-1.amazonaws.com", "587", "AKIAEXAMPLE", "pw", "eu-central-1", nil)
 	got := map[string]sesSmtpEnvVariable{}
 	for _, v := range vars {
 		got[v.name] = v
@@ -108,9 +108,9 @@ func TestSesSmtpEnvVariablesAndTplExtension(t *testing.T) {
 	}, got)
 	require.Len(t, vars, 5)
 
-	ext := sesSmtpTplExtension(&aws.SesSmtpUser{}, "h", "587", "u", "p", "r")
+	ext := sesSmtpTplExtension(&aws.SesSmtpUser{}, "h", "587", "u", "p", "r", nil)
 	require.Equal(t, map[string]string{"smtp-user": "u", "smtp-password": "p", "smtp-host": "h", "smtp-port": "587", "region": "r"}, ext)
-	ext = sesSmtpTplExtension(&aws.SesSmtpUser{ConfigurationSet: "mautic"}, "h", "587", "u", "p", "r")
+	ext = sesSmtpTplExtension(&aws.SesSmtpUser{ConfigurationSet: "mautic"}, "h", "587", "u", "p", "r", nil)
 	require.Equal(t, "mautic", ext["configuration-set"])
 }
 
@@ -461,4 +461,126 @@ func TestSesSmtpUserComputeProcessor_PasswordMustBeSecretInParent(t *testing.T) 
 		return runSesCompute(ctx, newIfNotExistCollector(), sesTestParent, "mautic-ses", &aws.SesSmtpUser{})
 	}, sdk.WithMocks("project", "stack", mocks))
 	require.ErrorContains(t, err, "smtp-password")
+}
+
+type sesPolicyDocAny struct {
+	Statement []struct {
+		Sid       string
+		Effect    string
+		Action    []string
+		Resource  any
+		Condition map[string]map[string][]string
+	}
+}
+
+func TestSesSmtpUserPolicy_APIAccess(t *testing.T) {
+	doc, err := sesSmtpUserPolicy(&aws.SesSmtpUser{
+		Identities:       []string{"innmind.com"},
+		ConfigurationSet: "mautic-ses-events--prod",
+		FromAddresses:    []string{"*@innmind.com"},
+		APIAccess:        true,
+	}, "eu-central-1", "645119433725")
+	require.NoError(t, err)
+	var p sesPolicyDocAny
+	require.NoError(t, json.Unmarshal([]byte(doc), &p))
+	require.Len(t, p.Statement, 2)
+
+	send := p.Statement[0]
+	require.Equal(t, []string{"ses:SendRawEmail", "ses:SendEmail"}, send.Action)
+	// SES authorizes a send against the identity AND the configuration set.
+	require.Equal(t, []any{
+		"arn:aws:ses:eu-central-1:645119433725:identity/innmind.com",
+		"arn:aws:ses:eu-central-1:645119433725:configuration-set/mautic-ses-events--prod",
+	}, send.Resource)
+	require.Equal(t, map[string]map[string][]string{"StringLike": {"ses:FromAddress": {"*@innmind.com"}}}, send.Condition)
+
+	get := p.Statement[1]
+	require.Equal(t, "Allow", get.Effect)
+	require.Equal(t, []string{"ses:GetAccount"}, get.Action)
+	require.Equal(t, "*", get.Resource)
+	require.Nil(t, get.Condition)
+}
+
+func TestSesSmtpUserPolicy_NoAPIAccessUnchanged(t *testing.T) {
+	doc := parseSesPolicy(t, &aws.SesSmtpUser{Identities: []string{"innmind.com"}, ConfigurationSet: "mautic"}, "eu-central-1", "645119433725")
+	require.Len(t, doc.Statement, 1)
+	require.Equal(t, []string{"ses:SendRawEmail"}, doc.Statement[0].Action)
+}
+
+func TestSesSmtpUser_APIAccessExports(t *testing.T) {
+	values, secrets, _ := runSesSmtpUser(t, &aws.SesSmtpUser{
+		AccountConfig: aws.AccountConfig{
+			Account:     "645119433725",
+			Credentials: api.Credentials{Credentials: `{"region":"eu-central-1"}`},
+		},
+		Identities: []string{"innmind.com"},
+		APIAccess:  true,
+	})
+	require.Equal(t, "AKIAEXAMPLE", values["mautic-ses--prod-ses-api-access-key"])
+	require.Equal(t, "some+secret+key", values["mautic-ses--prod-ses-api-secret-key"])
+	require.True(t, secrets["mautic-ses--prod-ses-api-secret-key"], "api secret key must be a secret in state")
+	require.False(t, secrets["mautic-ses--prod-ses-api-access-key"])
+	// Existing outputs are unchanged.
+	require.Equal(t, "AKIAEXAMPLE", values["mautic-ses--prod-ses-smtp-username"])
+	require.True(t, secrets["mautic-ses--prod-ses-smtp-password"])
+
+	values, _, _ = runSesSmtpUser(t, &aws.SesSmtpUser{
+		AccountConfig: aws.AccountConfig{Account: "645119433725", Credentials: api.Credentials{Credentials: `{"region":"eu-central-1"}`}},
+		Identities:    []string{"innmind.com"},
+	})
+	require.NotContains(t, values, "mautic-ses--prod-ses-api-access-key")
+	require.NotContains(t, values, "mautic-ses--prod-ses-api-secret-key")
+}
+
+func (m *sesParentMocks) withSesApiParentOutputs(resName, accessKey, secretKey string, secret bool) *sesParentMocks {
+	m.outputs[resName+"-ses-api-access-key"] = accessKey
+	m.outputs[resName+"-ses-api-secret-key"] = secretKey
+	if secret {
+		m.secret = append(m.secret, resName+"-ses-api-secret-key")
+	}
+	return m
+}
+
+func TestSesSmtpUserComputeProcessor_APIAccess(t *testing.T) {
+	mocks := (&sesParentMocks{}).
+		withSesParentOutputs("mautic-ses--prod", "AKIAEXAMPLE", "pw", "eu-central-1").
+		withSesApiParentOutputs("mautic-ses--prod", "AKIAEXAMPLE", "some+secret+key", true)
+	collector := newIfNotExistCollector()
+	err := sdk.RunErr(func(ctx *sdk.Context) error {
+		return runSesCompute(ctx, collector, sesTestParent, "mautic-ses", &aws.SesSmtpUser{Identities: []string{"innmind.com"}, APIAccess: true})
+	}, sdk.WithMocks("project", "stack", mocks))
+	require.NoError(t, err)
+
+	require.Equal(t, "AKIAEXAMPLE", collector.tpl["mautic-ses"]["access-key"])
+	require.Equal(t, "some+secret+key", collector.tpl["mautic-ses"]["secret-key"])
+	require.Equal(t, "pw", collector.tpl["mautic-ses"]["smtp-password"])
+	require.Equal(t, map[string]string{
+		"SMTP_MAUTIC_SES__PROD_USER":      "AKIAEXAMPLE",
+		"SMTP_MAUTIC_SES__PROD_PASSWORD":  "pw",
+		"SES_MAUTIC_SES__PROD_ACCESS_KEY": "AKIAEXAMPLE",
+		"SES_MAUTIC_SES__PROD_SECRET_KEY": "some+secret+key",
+	}, collector.secret)
+	require.Empty(t, collector.dropped)
+}
+
+func TestSesSmtpUserComputeProcessor_APISecretMustBeSecretInParent(t *testing.T) {
+	mocks := (&sesParentMocks{}).
+		withSesParentOutputs("mautic-ses--prod", "AKIAEXAMPLE", "pw", "eu-central-1").
+		withSesApiParentOutputs("mautic-ses--prod", "AKIAEXAMPLE", "plaintext", false)
+	err := sdk.RunErr(func(ctx *sdk.Context) error {
+		return runSesCompute(ctx, newIfNotExistCollector(), sesTestParent, "mautic-ses", &aws.SesSmtpUser{APIAccess: true})
+	}, sdk.WithMocks("project", "stack", mocks))
+	require.ErrorContains(t, err, "ses-api-secret-key")
+}
+
+func TestSesSmtpUserComputeProcessor_NoAPIKeysWithoutAPIAccess(t *testing.T) {
+	mocks := (&sesParentMocks{}).withSesParentOutputs("mautic-ses--prod", "AKIAEXAMPLE", "pw", "eu-central-1")
+	collector := newIfNotExistCollector()
+	err := sdk.RunErr(func(ctx *sdk.Context) error {
+		return runSesCompute(ctx, collector, sesTestParent, "mautic-ses", &aws.SesSmtpUser{})
+	}, sdk.WithMocks("project", "stack", mocks))
+	require.NoError(t, err)
+	require.NotContains(t, collector.tpl["mautic-ses"], "access-key")
+	require.NotContains(t, collector.tpl["mautic-ses"], "secret-key")
+	require.NotContains(t, collector.secret, "SES_MAUTIC_SES__PROD_SECRET_KEY")
 }

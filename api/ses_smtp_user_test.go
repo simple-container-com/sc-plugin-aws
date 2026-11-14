@@ -4,6 +4,7 @@
 package aws
 
 import (
+	"strings"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -69,5 +70,33 @@ func TestValidateSesSmtpUserName(t *testing.T) {
 	}
 	for _, name := range []string{"mail_a", "mailA", "MAIL-A", "-mail", "mail-", "mail.a", ""} {
 		Expect(ValidateSesSmtpUserName(name)).To(MatchError(ContainSubstring("lowercase letters, digits and hyphens")), name)
+	}
+}
+
+func TestReadSesSmtpUserConfig_APIAccess(t *testing.T) {
+	RegisterTestingT(t)
+
+	res, err := ReadSesSmtpUserConfig(&api.Config{Config: map[string]any{
+		"region":     "eu-central-1",
+		"identities": []any{"innmind.com"},
+		"apiAccess":  true,
+	}})
+	Expect(err).ToNot(HaveOccurred())
+	Expect(res.Config.(*SesSmtpUser).APIAccess).To(BeTrue())
+
+	res, err = ReadSesSmtpUserConfig(&api.Config{Config: map[string]any{"identities": []any{"innmind.com"}}})
+	Expect(err).ToNot(HaveOccurred())
+	Expect(res.Config.(*SesSmtpUser).APIAccess).To(BeFalse(), "apiAccess defaults to false")
+}
+
+func TestSesSmtpUserValidate_ConfigurationSet(t *testing.T) {
+	RegisterTestingT(t)
+
+	for _, cs := range []string{"mautic", "mautic-ses-events--prod", "My_Set-1"} {
+		Expect((&SesSmtpUser{Identities: []string{"innmind.com"}, ConfigurationSet: cs}).Validate()).To(Succeed(), cs)
+	}
+	for _, cs := range []string{"*", "mautic*", "maut?c", "a/b", "a b", "arn:aws:ses:eu-central-1:645119433725:configuration-set/x", strings.Repeat("a", 65)} {
+		Expect((&SesSmtpUser{Identities: []string{"innmind.com"}, ConfigurationSet: cs}).Validate()).
+			To(MatchError(ContainSubstring("configurationSet")), cs)
 	}
 }

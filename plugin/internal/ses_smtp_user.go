@@ -53,7 +53,7 @@ func SesSmtpUser(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, par
 		return nil, err
 	}
 	resName := input.ToResName(baseName)
-	creds, err := sesCredentialsAccount(cfg)
+	creds, err := sesCredentialsAccount(&cfg.AccountConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -123,6 +123,10 @@ func SesSmtpUser(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, par
 	ctx.Export(toSesSmtpHostExport(resName), sdk.String(sesSmtpHost(region)))
 	ctx.Export(toSesSmtpPortExport(resName), sdk.String(strconv.Itoa(aws.SesSmtpUserDefaultPort)))
 	ctx.Export(toSesRegionExport(resName), sdk.String(region))
+	if cfg.APIAccess {
+		ctx.Export(toSesApiAccessKeyExport(resName), accessKey.ID())
+		ctx.Export(toSesApiSecretKeyExport(resName), sdk.ToSecret(accessKey.Secret))
+	}
 
 	return &api.ResourceOutput{Ref: &SesSmtpUserOutput{
 		User:         user,
@@ -134,7 +138,8 @@ func SesSmtpUser(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, par
 
 // SesSmtpUserComputeProcessor reads the parent stack's SMTP exports and hands
 // them to a consuming stack (`uses: [<resource>]`) as env vars and as
-// `${resource:<resource>.smtp-user|smtp-password|smtp-host|smtp-port|region}`.
+// `${resource:<resource>.smtp-user|smtp-password|smtp-host|smtp-port|region}`
+// (plus `access-key|secret-key` with `apiAccess`).
 func SesSmtpUserComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, collector pApi.ComputeContextCollector, params pApi.ProvisionParams) (*api.ResourceOutput, error) {
 	if params.ParentStack == nil {
 		return nil, errors.Errorf("parent stack must not be nil for compute processor for %q", stack.Name)
@@ -196,20 +201,38 @@ func SesSmtpUserComputeProcessor(ctx *sdk.Context, stack api.Stack, input api.Re
 	if err != nil {
 		return nil, err
 	}
+	var apiKeys *sesApiKeys
+	if cfg.APIAccess {
+		accessKey, err := read(toSesApiAccessKeyExport(resName), false)
+		if err != nil {
+			return nil, err
+		}
+		secretKey, err := read(toSesApiSecretKeyExport(resName), true)
+		if err != nil {
+			return nil, err
+		}
+		apiKeys = &sesApiKeys{accessKey: accessKey, secretKey: secretKey}
+	}
 
 	collector.AddOutput(ctx, parentRef.Name.ApplyT(func(refName any) any {
-		for _, v := range sesSmtpEnvVariables(resName, smtpHost, smtpPort, smtpUser, smtpPassword, region) {
+		for _, v := range sesSmtpEnvVariables(resName, smtpHost, smtpPort, smtpUser, smtpPassword, region, apiKeys) {
 			if v.secret {
 				collector.AddSecretEnvVariableIfNotExist(v.name, v.value, input.Descriptor.Type, input.Descriptor.Name, parentStackName)
 			} else {
 				collector.AddEnvVariableIfNotExist(v.name, v.value, input.Descriptor.Type, input.Descriptor.Name, parentStackName)
 			}
 		}
-		collector.AddResourceTplExtension(input.Descriptor.Name, sesSmtpTplExtension(cfg, smtpHost, smtpPort, smtpUser, smtpPassword, region))
+		collector.AddResourceTplExtension(input.Descriptor.Name, sesSmtpTplExtension(cfg, smtpHost, smtpPort, smtpUser, smtpPassword, region, apiKeys))
 		return nil
 	}))
 
 	return &api.ResourceOutput{Ref: parentStackName}, nil
+}
+
+// sesApiKeys are the SES API credentials handed out with `apiAccess`.
+type sesApiKeys struct {
+	accessKey string
+	secretKey string
 }
 
 type sesSmtpEnvVariable struct {
@@ -222,19 +245,28 @@ type sesSmtpEnvVariable struct {
 // all scoped to the resource (SMTP_<RES>_*, SES_<RES>_REGION). There are
 // deliberately no unscoped SMTP_* / SES_REGION vars: SC keeps the first value
 // of a duplicate env name, so with two SES resources in `uses:` they would
-// silently point at whichever was processed first.
-func sesSmtpEnvVariables(resName, host, port, user, password, region string) []sesSmtpEnvVariable {
+// silently point at whichever was processed first. With `apiAccess` the API
+// key pair is added as SES_<RES>_ACCESS_KEY / SES_<RES>_SECRET_KEY, both
+// secret like the SMTP user and password.
+func sesSmtpEnvVariables(resName, host, port, user, password, region string, apiKeys *sesApiKeys) []sesSmtpEnvVariable {
 	prefix := fmt.Sprintf("SMTP_%s_", resName)
-	return []sesSmtpEnvVariable{
+	vars := []sesSmtpEnvVariable{
 		{util.ToEnvVariableName(prefix + "HOST"), host, false},
 		{util.ToEnvVariableName(prefix + "PORT"), port, false},
 		{util.ToEnvVariableName(prefix + "USER"), user, true},
 		{util.ToEnvVariableName(prefix + "PASSWORD"), password, true},
 		{util.ToEnvVariableName(fmt.Sprintf("SES_%s_REGION", resName)), region, false},
 	}
+	if apiKeys != nil {
+		vars = append(vars,
+			sesSmtpEnvVariable{util.ToEnvVariableName(fmt.Sprintf("SES_%s_ACCESS_KEY", resName)), apiKeys.accessKey, true},
+			sesSmtpEnvVariable{util.ToEnvVariableName(fmt.Sprintf("SES_%s_SECRET_KEY", resName)), apiKeys.secretKey, true},
+		)
+	}
+	return vars
 }
 
-func sesSmtpTplExtension(cfg *aws.SesSmtpUser, host, port, user, password, region string) map[string]string {
+func sesSmtpTplExtension(cfg *aws.SesSmtpUser, host, port, user, password, region string, apiKeys *sesApiKeys) map[string]string {
 	ext := map[string]string{
 		"smtp-user":     user,
 		"smtp-password": password,
@@ -245,17 +277,21 @@ func sesSmtpTplExtension(cfg *aws.SesSmtpUser, host, port, user, password, regio
 	if cfg.ConfigurationSet != "" {
 		ext["configuration-set"] = cfg.ConfigurationSet
 	}
+	if apiKeys != nil {
+		ext["access-key"] = apiKeys.accessKey
+		ext["secret-key"] = apiKeys.secretKey
+	}
 	return ext
 }
 
 // sesCredentialsAccount decodes the `${auth:...}` credentials blob, if any,
 // for its region and account. The provider is built from the same blob.
-func sesCredentialsAccount(cfg *aws.SesSmtpUser) (aws.AccountConfig, error) {
+func sesCredentialsAccount(account *aws.AccountConfig) (aws.AccountConfig, error) {
 	var creds aws.AccountConfig
-	if cfg.CredentialsValue() == "" {
+	if account.CredentialsValue() == "" {
 		return creds, nil
 	}
-	if err := api.ConvertAuth(&cfg.AccountConfig, &creds); err != nil {
+	if err := api.ConvertAuth(account, &creds); err != nil {
 		return creds, errors.Wrap(err, "failed to convert aws account config")
 	}
 	return creds, nil
@@ -271,12 +307,20 @@ func sesSmtpUserPolicy(cfg *aws.SesSmtpUser, region, account string) (string, er
 		return fmt.Sprintf("arn:%s:ses:%s:%s:identity/%s", partition, region, account, id)
 	})
 	if cfg.ConfigurationSet != "" {
-		resources = append(resources, fmt.Sprintf("arn:%s:ses:%s:%s:configuration-set/%s", partition, region, account, cfg.ConfigurationSet))
+		resources = append(resources, sesConfigurationSetArn(region, account, cfg.ConfigurationSet))
+	}
+	// SES authorizes a send against every resource it involves: the
+	// identity and, when the message uses one, the configuration set. Both
+	// are listed, and the same statement (and ses:FromAddress condition)
+	// covers the API's ses:SendEmail when apiAccess is on.
+	actions := []string{"ses:SendRawEmail"}
+	if cfg.APIAccess {
+		actions = append(actions, "ses:SendEmail")
 	}
 	statement := map[string]any{
 		"Sid":      "SesSmtpSendRawEmail",
 		"Effect":   "Allow",
-		"Action":   []string{"ses:SendRawEmail"},
+		"Action":   actions,
 		"Resource": resources,
 	}
 	if len(cfg.FromAddresses) > 0 {
@@ -286,9 +330,20 @@ func sesSmtpUserPolicy(cfg *aws.SesSmtpUser, region, account string) (string, er
 			},
 		}
 	}
+	statements := []any{statement}
+	if cfg.APIAccess {
+		// ses:GetAccount (sending quota and status) supports no resource
+		// scoping, so it gets its own statement on `*`.
+		statements = append(statements, map[string]any{
+			"Sid":      "SesApiGetAccount",
+			"Effect":   "Allow",
+			"Action":   []string{"ses:GetAccount"},
+			"Resource": "*",
+		})
+	}
 	doc, err := json.Marshal(map[string]any{
 		"Version":   "2012-10-17",
-		"Statement": []any{statement},
+		"Statement": statements,
 	})
 	if err != nil {
 		return "", err
@@ -350,4 +405,12 @@ func toSesSmtpPortExport(resName string) string {
 
 func toSesRegionExport(resName string) string {
 	return fmt.Sprintf("%s-ses-region", resName)
+}
+
+func toSesApiAccessKeyExport(resName string) string {
+	return fmt.Sprintf("%s-ses-api-access-key", resName)
+}
+
+func toSesApiSecretKeyExport(resName string) string {
+	return fmt.Sprintf("%s-ses-api-secret-key", resName)
 }
