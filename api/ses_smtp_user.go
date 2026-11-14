@@ -39,12 +39,21 @@ type SesSmtpUser struct {
 	// identity ARNs. Required.
 	Identities []string `json:"identities" yaml:"identities"`
 	// ConfigurationSet, when set, is added to the policy resources so sends
-	// that use it (X-SES-CONFIGURATION-SET header) are authorized, and is
-	// exposed to consumers as `configuration-set`.
+	// that use it (X-SES-CONFIGURATION-SET header, or ConfigurationSetName on
+	// the API) are authorized - SES authorizes such a send against both the
+	// identity and the configuration set ARN - and is exposed to consumers as
+	// `configuration-set`. For a set created by aws-ses-configuration-set
+	// this is its full name, `<name>--<env>`.
 	ConfigurationSet string `json:"configurationSet,omitempty" yaml:"configurationSet,omitempty"`
 	// FromAddresses, when set, restricts sends with a `ses:FromAddress`
 	// StringLike condition (wildcards allowed, e.g. `*@example.com`).
 	FromAddresses []string `json:"fromAddresses,omitempty" yaml:"fromAddresses,omitempty"`
+	// APIAccess additionally allows the SES v2 API: ses:SendEmail on the same
+	// resources and under the same conditions as ses:SendRawEmail, plus
+	// ses:GetAccount (read-only, not resource-scoped; API clients use it for
+	// the sending quota). The access key ID and secret are then also
+	// exported as `access-key` and `secret-key`.
+	APIAccess bool `json:"apiAccess,omitempty" yaml:"apiAccess,omitempty"`
 }
 
 // Validate checks the fields the plugin cannot default.
@@ -62,6 +71,12 @@ func (c *SesSmtpUser) Validate() error {
 			return errors.Errorf("%s: `identities[%d]` (%q) contains a wildcard (`*` or `?`); list each SES identity explicitly",
 				ResourceTypeSesSmtpUser, i, id)
 		}
+	}
+	// SES configuration set names allow only letters, digits, `-` and `_`;
+	// in particular `*` / `?` would make the policy resource an IAM pattern.
+	if c.ConfigurationSet != "" && !sesConfigurationSetNameRe.MatchString(c.ConfigurationSet) {
+		return errors.Errorf("%s: `configurationSet` (%q) must be an SES configuration set name (letters, digits, `-` and `_`, at most %d characters)",
+			ResourceTypeSesSmtpUser, c.ConfigurationSet, SesConfigurationSetNameMaxLen)
 	}
 	for i, from := range c.FromAddresses {
 		if strings.TrimSpace(from) == "" {
@@ -89,12 +104,25 @@ var SesSmtpRegions = []string{
 
 // ValidateSesSmtpRegion fails for a region without an SES SMTP endpoint.
 func ValidateSesSmtpRegion(region string) error {
+	return validateSesRegion(ResourceTypeSesSmtpUser, region)
+}
+
+// ValidateSesConfigurationSetRegion applies the aws-ses-smtp-user region
+// allowlist to aws-ses-configuration-set, so a configuration set can always
+// be used by an SMTP user in the same region.
+func ValidateSesConfigurationSetRegion(region string) error {
+	return validateSesRegion(ResourceTypeSesConfigurationSet, region)
+}
+
+func validateSesRegion(resourceType, region string) error {
 	if !slices.Contains(SesSmtpRegions, region) {
 		return errors.Errorf("%s: region %q has no Amazon SES SMTP endpoint; use one of %s (see https://docs.aws.amazon.com/general/latest/gr/ses.html#ses_smtp_endpoints)",
-			ResourceTypeSesSmtpUser, region, strings.Join(SesSmtpRegions, ", "))
+			resourceType, region, strings.Join(SesSmtpRegions, ", "))
 	}
 	return nil
 }
+
+var sesConfigurationSetNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 var sesSmtpUserNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
