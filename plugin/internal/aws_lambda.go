@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -96,33 +98,50 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 
 	tags := pApi.BuildTagsFromStackParams(deployParams).ToAWSTags()
 
-	// Pull-only fast path: operator declared `image.name` without
-	// `dockerfile`/`context`. The Lambda uses the referenced image
-	// directly as its ImageUri; SC core skips the build+push dance
-	// entirely. Covers Components dispatched into aws-lambda whose
-	// config holds a pre-built image ref (e.g. the backup plugin's
+	// Pre-built image rewrap: operator declared `image.name` without
+	// `dockerfile`/`context`. AWS Lambda refuses non-ECR source images
+	// (`InvalidParameterValueException: Source image X is not valid`),
+	// so we can't just hand the public ref through as ImageUri.
+	// Instead: generate a tiny `FROM ${SOURCE_IMAGE}` Dockerfile on
+	// disk, build+push to ECR via the normal path, and point the
+	// Lambda at the ECR URI. Same pattern as the cloud-helpers
+	// alert image in alerts.go.
+	//
+	// Covers Components dispatched into aws-lambda whose config
+	// holds a pre-built public registry ref (e.g. the backup plugin's
 	// `simplecontainer/sc-component-backup:latest`) — slice 1a/5 of
 	// sc-components-platform.
-	var image *dockerImageOut
-	if stackConfig.Image.Name != "" && stackConfig.Image.Dockerfile == "" && stackConfig.Image.Context == "" {
-		params.Log.Info(ctx.Context(), "lambda uses pre-built image %q (pull-only; no build)", stackConfig.Image.Name)
-		image = &dockerImageOut{
-			deployImageRef: sdk.String(stackConfig.Image.Name).ToStringOutput(),
-		}
-	} else {
-		var err error
-		image, err = buildAndPushDockerImageV2(ctx, stack, params, deployParams, dockerImage{
-			name:       stack.Name,
-			dockerfile: stackConfig.Image.Dockerfile,
-			context:    stackConfig.Image.Context,
-			args:       lo.FromPtr(stackConfig.Image.Build).Args,
-			version:    lo.If(deployParams.Version != "", deployParams.Version).Else("latest"),
-		})
+	dockerfilePath := stackConfig.Image.Dockerfile
+	buildContext := stackConfig.Image.Context
+	buildArgs := lo.FromPtr(stackConfig.Image.Build).Args
+	if stackConfig.Image.Name != "" && dockerfilePath == "" && buildContext == "" {
+		params.Log.Info(ctx.Context(), "lambda: rewrapping pre-built image %q via a FROM-only Dockerfile pushed to ECR", stackConfig.Image.Name)
+		tmpDir, err := os.MkdirTemp("", fmt.Sprintf("sc-aws-lambda-rewrap-%s-", stack.Name))
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to build and push image for lambda in stack %q env %q", stack.Name, deployParams.Environment)
+			return nil, errors.Wrapf(err, "failed to create tmpdir for rewrap Dockerfile")
 		}
-		opts = append(opts, image.addOpts...)
+		dockerfilePath = filepath.Join(tmpDir, "Dockerfile")
+		if werr := os.WriteFile(dockerfilePath, []byte("ARG SOURCE_IMAGE\nFROM ${SOURCE_IMAGE}\n"), 0o600); werr != nil {
+			return nil, errors.Wrapf(werr, "failed to write rewrap Dockerfile")
+		}
+		buildContext = tmpDir
+		if buildArgs == nil {
+			buildArgs = map[string]string{}
+		}
+		buildArgs["SOURCE_IMAGE"] = stackConfig.Image.Name
 	}
+
+	image, err := buildAndPushDockerImageV2(ctx, stack, params, deployParams, dockerImage{
+		name:       stack.Name,
+		dockerfile: dockerfilePath,
+		context:    buildContext,
+		args:       buildArgs,
+		version:    lo.If(deployParams.Version != "", deployParams.Version).Else("latest"),
+	})
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to build and push image for lambda in stack %q env %q", stack.Name, deployParams.Environment)
+	}
+	opts = append(opts, image.addOpts...)
 
 	secretEnvVariables := lo.Filter(params.ComputeContext.SecretEnvVariables(), func(s pApi.ComputeEnvVariable, _ int) bool {
 		return stackConfig.Secrets[s.Name] == ""
