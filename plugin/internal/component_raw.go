@@ -93,6 +93,36 @@ func applyComponentRawToSingleImage(cfg *api.StackConfigSingleImage, raw map[str
 		}
 	}
 
+	// secrets: component's keys merged into cfg.Secrets (operator wins on
+	// collision — matches the signingKey precedence block below). Populated
+	// by SC core's `dispatchComponentTemplate` from the plugin's advertised
+	// `SchemaResponse.component_secret_env_map` (api PR #630 → v>=TBD):
+	// Component top-level `${secret:...}` fields land here keyed by the env
+	// var name the dispatched service should bind each to. Lambda's
+	// provisioner later wires each entry to a per-function SecretsManager
+	// secret (never a plain env var at rest) — fleet secret-handling
+	// convention preserved.
+	//
+	// Pre-field plugin binaries (binaries that don't advertise the map)
+	// land nothing here; the hardcoded `signingKey → SERVICE_JWT_SECRET`
+	// block below keeps working against them until they release the
+	// Schema update.
+	if v, ok := raw["secrets"]; ok && v != nil {
+		secretsMap, err := parseComponentStringMap(v, "secrets")
+		if err != nil {
+			return err
+		}
+		if cfg.Secrets == nil {
+			cfg.Secrets = map[string]string{}
+		}
+		for k, val := range secretsMap {
+			if _, present := cfg.Secrets[k]; present {
+				continue // operator wins
+			}
+			cfg.Secrets[k] = val
+		}
+	}
+
 	// ingress.hostname → cfg.Domain. ingress.registrar is deliberately ignored
 	// here; see the doc comment above.
 	if v, ok := raw["ingress"]; ok && v != nil {
