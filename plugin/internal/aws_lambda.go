@@ -96,17 +96,33 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 
 	tags := pApi.BuildTagsFromStackParams(deployParams).ToAWSTags()
 
-	image, err := buildAndPushDockerImageV2(ctx, stack, params, deployParams, dockerImage{
-		name:       stack.Name,
-		dockerfile: stackConfig.Image.Dockerfile,
-		context:    stackConfig.Image.Context,
-		args:       lo.FromPtr(stackConfig.Image.Build).Args,
-		version:    lo.If(deployParams.Version != "", deployParams.Version).Else("latest"),
-	})
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to build and push image for lambda in stack %q env %q", stack.Name, deployParams.Environment)
+	// Pull-only fast path: operator declared `image.name` without
+	// `dockerfile`/`context`. The Lambda uses the referenced image
+	// directly as its ImageUri; SC core skips the build+push dance
+	// entirely. Covers Components dispatched into aws-lambda whose
+	// config holds a pre-built image ref (e.g. the backup plugin's
+	// `simplecontainer/sc-component-backup:latest`) — slice 1a/5 of
+	// sc-components-platform.
+	var image *dockerImageOut
+	if stackConfig.Image.Name != "" && stackConfig.Image.Dockerfile == "" && stackConfig.Image.Context == "" {
+		params.Log.Info(ctx.Context(), "lambda uses pre-built image %q (pull-only; no build)", stackConfig.Image.Name)
+		image = &dockerImageOut{
+			deployImageRef: sdk.String(stackConfig.Image.Name).ToStringOutput(),
+		}
+	} else {
+		var err error
+		image, err = buildAndPushDockerImageV2(ctx, stack, params, deployParams, dockerImage{
+			name:       stack.Name,
+			dockerfile: stackConfig.Image.Dockerfile,
+			context:    stackConfig.Image.Context,
+			args:       lo.FromPtr(stackConfig.Image.Build).Args,
+			version:    lo.If(deployParams.Version != "", deployParams.Version).Else("latest"),
+		})
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to build and push image for lambda in stack %q env %q", stack.Name, deployParams.Environment)
+		}
+		opts = append(opts, image.addOpts...)
 	}
-	opts = append(opts, image.addOpts...)
 
 	secretEnvVariables := lo.Filter(params.ComputeContext.SecretEnvVariables(), func(s pApi.ComputeEnvVariable, _ int) bool {
 		return stackConfig.Secrets[s.Name] == ""
