@@ -160,6 +160,41 @@ func TestApplyComponentRawToSingleImage_SigningKey_OperatorSecretWins(t *testing
 	Ω(cfg.Secrets["SERVICE_JWT_SECRET"]).To(Equal("${secret:OPERATOR_PICK}"))
 }
 
+// secrets: generic passthrough added alongside api PR #630 — SC core's
+// `dispatchComponentTemplate` translates Component top-level fields
+// declared in `SchemaResponse.component_secret_env_map` into
+// `merged["secrets"]`, and this overlay hands them through to
+// `cfg.Secrets` so the Lambda provisioner wires each to SecretsManager.
+func TestApplyComponentRawToSingleImage_SecretsPassthrough(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{}
+	Ω(applyComponentRawToSingleImage(cfg, map[string]any{
+		"secrets": map[string]any{
+			"SERVICE_JWT_SECRET":       "${secret:jwt}",
+			"BACKUP_OPERATOR_PASSWORD": "${secret:op-pw}",
+		},
+	})).To(Succeed())
+	Ω(cfg.Secrets["SERVICE_JWT_SECRET"]).To(Equal("${secret:jwt}"))
+	Ω(cfg.Secrets["BACKUP_OPERATOR_PASSWORD"]).To(Equal("${secret:op-pw}"))
+}
+
+// Operator-declared cfg.Secrets entries win against the component's
+// secrets map, matching the signingKey precedence rule.
+func TestApplyComponentRawToSingleImage_SecretsOperatorWins(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{
+		Secrets: map[string]string{"SERVICE_JWT_SECRET": "${secret:OPERATOR_PICK}"},
+	}
+	Ω(applyComponentRawToSingleImage(cfg, map[string]any{
+		"secrets": map[string]any{
+			"SERVICE_JWT_SECRET":       "${secret:COMPONENT_PICK}",
+			"BACKUP_OPERATOR_PASSWORD": "${secret:op-pw}",
+		},
+	})).To(Succeed())
+	Ω(cfg.Secrets["SERVICE_JWT_SECRET"]).To(Equal("${secret:OPERATOR_PICK}"))
+	Ω(cfg.Secrets["BACKUP_OPERATOR_PASSWORD"]).To(Equal("${secret:op-pw}"))
+}
+
 func TestApplyComponentRawToSingleImage_FullHappyPath(t *testing.T) {
 	RegisterTestingT(t)
 	cfg := &api.StackConfigSingleImage{}
