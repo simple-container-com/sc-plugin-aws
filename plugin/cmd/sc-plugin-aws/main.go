@@ -162,6 +162,32 @@ func (p *awsPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scp
 			// per api #557.
 			"aws:ecs/taskDefinition:TaskDefinition",
 		},
+		ConfigRegeneratedTypes: []string{
+			// SecretVersion carries a `secretString` that pulumi-aws marks
+			// ForceNew — any content change is an OpReplace. SC derives
+			// the value exclusively from `cfg.Secrets[...]` placeholders
+			// or a sibling plugin's `AddSecretEnvVariableIfNotExist`
+			// output on every apply (operators cannot stash arbitrary
+			// payloads through this path; see sc-plugin-aws component_raw.go
+			// `secrets:` passthrough).
+			//
+			// Blast radius in the window between delete and create: a
+			// Lambda cold start that resolves the ARN mid-apply may read
+			// the previous Version's bytes. Lambda `Environment.Variables`
+			// carry the ARN (not the bytes) and stay correct across the
+			// replace — no function recreation needed.
+			//
+			// Live-caught 2026-11-17 on backup-smoke-tier4 run 44046724312:
+			// sc-component-backup's ComputeProcess mints a per-consumer
+			// JWT (`BACKUP_TOKEN`) with fresh iat/exp on every deploy, so
+			// the secretString is replace-forcing by construction. Same
+			// shape applies to every fleet stack with a `cfg.Secrets`
+			// rotation. Rule-2 entry first shipped as an in-tree allowlist
+			// in api #631; the plugin now owns the advertisement per api
+			// #633. See
+			// forge/docs/roadmap/items/sc-plugin-registerable-config-regenerated-types.md.
+			"aws:secretsmanager/secretVersion:SecretVersion",
+		},
 	}, nil
 }
 
