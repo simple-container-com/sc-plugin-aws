@@ -30,6 +30,16 @@ type LambdaOutput struct {
 	sdk.Output
 }
 
+// componentEndpointURLKey mirrors pApi.ComponentEndpointURLKey — the
+// output-key convention SC core reads to wire DNS for Component
+// resources that declare ingress.hostname. Duplicated as a local
+// constant (rather than imported) to avoid a hard dependency on
+// a specific SC core minor release; a value drift between the two
+// is a build-time catch because both are referenced by string in
+// the same deploy binary and would mis-match loudly. See
+// forge/docs/design/2026-11-17/component-parent-dns-wiring/.
+const componentEndpointURLKey = "_endpoint_url"
+
 func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params pApi.ProvisionParams) (*api.ResourceOutput, error) {
 	if input.Descriptor.Type != aws.TemplateTypeAwsLambda {
 		return nil, errors.Errorf("unsupported template type %q", input.Descriptor.Type)
@@ -457,6 +467,16 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		}
 
 		ctx.Export(fmt.Sprintf("%s-%s-function-url", stack.Name, deployParams.Environment), apiGw.ApiEndpoint)
+		// Component-dispatch convention (api PR #635, v>=TBD): publish
+		// the Lambda's public URL under the standardized key so SC core
+		// can wire DNS for a Component declaring ingress.hostname. SC
+		// core reads this from the harvested ProvisionResponse.Outputs
+		// and calls ProvisionDomainForEndpoint itself (template plugin
+		// stays cloud-blind of the registrar). Published unconditionally
+		// — a client-stack deploy (non-Component) just has an extra
+		// export the compute processor ignores. See
+		// forge/docs/design/2026-11-17/component-parent-dns-wiring/.
+		ctx.Export(componentEndpointURLKey, apiGw.ApiEndpoint)
 		if stackConfig.Domain != "" {
 			_, err := provisionDNSForLambda(ctx, stack, params, lambdaName, stackConfig.Domain, apiGw.ApiEndpoint)
 			if err != nil {
@@ -505,6 +525,11 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 			return nil, errors.Wrapf(err, "failed to create lambda function url permission")
 		}
 		ctx.Export(fmt.Sprintf("%s-%s-function-url", stack.Name, deployParams.Environment), functionUrl.FunctionUrl)
+		// Component-dispatch convention (api PR #635, v>=TBD): publish
+		// the Function URL under the standardized key so SC core can
+		// wire DNS for a Component declaring ingress.hostname. See
+		// comment at the APIGW path above for the full rationale.
+		ctx.Export(componentEndpointURLKey, functionUrl.FunctionUrl)
 		if stackConfig.Domain != "" {
 			_, err := provisionDNSForLambda(ctx, stack, params, lambdaName, stackConfig.Domain, functionUrl.FunctionUrl)
 			if err != nil {
@@ -536,6 +561,25 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 }
 
 func provisionDNSForLambda(ctx *sdk.Context, stack api.Stack, params pApi.ProvisionParams, lambdaName, domain string, endpointUrl sdk.StringOutput) (*api.ResourceOutput, error) {
+	// Belt-and-suspenders: a parent-stack Component dispatch that
+	// somehow reached this code path (SC core's pre-dispatch strip of
+	// `ingress.hostname` is the primary guard; this catches
+	// pre-strip-era callers or a future dispatcher that forgets the
+	// strip) sees params.Registrar nil because the Registrar is a
+	// Pulumi-native object that cannot cross the plugin bus. Refuse
+	// with a clear diagnostic rather than nil-deref at line 548.
+	// Live-caught 2026-11-17 on backup-smoke-tier4 provision-preview
+	// run 44114692253.
+	if params.Registrar == nil {
+		return nil, errors.New(
+			"params.Registrar is nil in sc-plugin-aws (plugin-dispatched " +
+				"Lambda path): registrar cannot cross the plugin bus. " +
+				"If this is a Component resource with ingress.hostname, " +
+				"ensure SC core is recent enough to strip ingress.hostname " +
+				"before dispatch and wire DNS itself via " +
+				"ComponentEndpointURLKey; see " +
+				"forge/docs/design/2026-11-17/component-parent-dns-wiring/")
+	}
 	// the lambda function URL is a full URL, the registrar wants a bare hostname
 	endpointHost := endpointUrl.ApplyT(func(epUrl string) (string, error) {
 		parsed, err := url.Parse(epUrl)
