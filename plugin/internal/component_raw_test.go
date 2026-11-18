@@ -407,3 +407,58 @@ func TestBlockToEnvKey(t *testing.T) {
 		Ω(blockToEnvKey(tc.block, tc.field)).To(Equal(tc.want), "%s.%s", tc.block, tc.field)
 	}
 }
+
+// TestApplyComponentRawToSingleImage_MaxMemoryFromComponent — when the
+// operator template has no MaxMemory set, the component's raw
+// `maxMemory` fills the slot. Design doc "operator wins on compute
+// shape" only applies when the operator has set the value; an unset
+// slot falls back to the component value.
+func TestApplyComponentRawToSingleImage_MaxMemoryFromComponent(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{}
+	Ω(applyComponentRawToSingleImage(cfg, map[string]any{
+		"maxMemory": 2048,
+		"timeout":   85,
+	})).To(Succeed())
+	Ω(cfg.MaxMemory).NotTo(BeNil())
+	Ω(*cfg.MaxMemory).To(Equal(2048))
+	Ω(cfg.Timeout).NotTo(BeNil())
+	Ω(*cfg.Timeout).To(Equal(85))
+}
+
+// TestApplyComponentRawToSingleImage_MaxMemoryOperatorWins — when the
+// operator template sets MaxMemory, the component's raw value is
+// ignored. Mirrors the Image overlay's precedence.
+func TestApplyComponentRawToSingleImage_MaxMemoryOperatorWins(t *testing.T) {
+	RegisterTestingT(t)
+	opMem, opTimeout := 512, 30
+	cfg := &api.StackConfigSingleImage{MaxMemory: &opMem, Timeout: &opTimeout}
+	Ω(applyComponentRawToSingleImage(cfg, map[string]any{
+		"maxMemory": 2048,
+		"timeout":   85,
+	})).To(Succeed())
+	Ω(*cfg.MaxMemory).To(Equal(512), "operator-template MaxMemory wins")
+	Ω(*cfg.Timeout).To(Equal(30), "operator-template Timeout wins")
+}
+
+// TestApplyComponentRawToSingleImage_MaxMemoryFloatAccepted — YAML
+// numbers decode into float64 from encoding/json if they pass through
+// a map[string]interface{}; the helper must accept that shape too.
+func TestApplyComponentRawToSingleImage_MaxMemoryFloatAccepted(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{}
+	Ω(applyComponentRawToSingleImage(cfg, map[string]any{
+		"maxMemory": float64(1024),
+	})).To(Succeed())
+	Ω(*cfg.MaxMemory).To(Equal(1024))
+}
+
+// TestApplyComponentRawToSingleImage_MaxMemoryBadType — a string or
+// map in the slot is a parse-time typed error naming the field.
+func TestApplyComponentRawToSingleImage_MaxMemoryBadType(t *testing.T) {
+	RegisterTestingT(t)
+	cfg := &api.StackConfigSingleImage{}
+	err := applyComponentRawToSingleImage(cfg, map[string]any{"maxMemory": "big"})
+	Ω(err).To(HaveOccurred())
+	Ω(err.Error()).To(ContainSubstring("maxMemory"))
+}

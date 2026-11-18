@@ -225,7 +225,54 @@ func applyComponentRawToSingleImage(cfg *api.StackConfigSingleImage, raw map[str
 		}
 	}
 
+	// maxMemory / timeout — compute-shape fields the design doc (§P1 v1.5)
+	// names "operator wins on compute shape". If the operator set
+	// `maxMemory` / `timeout` on the TEMPLATE in server.yaml the pointer is
+	// already non-nil and the component value is ignored (operator wins);
+	// otherwise the component's value fills the slot. The default-128MB
+	// Lambda shape without this overlay (`lambdaSizeMb` in aws_lambda.go:297)
+	// OOMs any backup component running mongodump in-process on a real DB
+	// (requestId 06a3aa57 on backup.simple-forge.com, forge-notifier
+	// adoption 2026-11-18): the plugin accepted the component's
+	// `maxMemory: 2048` into its allowlist but the overlay never wired it
+	// through to cfg.MaxMemory, so the Lambda deployed at 128MB regardless.
+	if cfg.MaxMemory == nil {
+		if v, ok := raw["maxMemory"]; ok && v != nil {
+			n, err := componentConfigInt(v, "maxMemory")
+			if err != nil {
+				return err
+			}
+			cfg.MaxMemory = &n
+		}
+	}
+	if cfg.Timeout == nil {
+		if v, ok := raw["timeout"]; ok && v != nil {
+			n, err := componentConfigInt(v, "timeout")
+			if err != nil {
+				return err
+			}
+			cfg.Timeout = &n
+		}
+	}
+
 	return nil
+}
+
+// componentConfigInt accepts the two YAML-decoded number shapes (int,
+// float64) and returns an int. Any other type returns a typed error
+// naming the field, matching the parse-time error shape the other
+// overlay helpers produce.
+func componentConfigInt(v any, field string) (int, error) {
+	switch x := v.(type) {
+	case int:
+		return x, nil
+	case int64:
+		return int(x), nil
+	case float64:
+		return int(x), nil
+	default:
+		return 0, errors.Errorf("%s: want int, got %T", field, v)
+	}
 }
 
 // cloudExtrasListKeys names the JSON keys on aws.CloudExtras that are
