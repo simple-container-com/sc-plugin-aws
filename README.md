@@ -113,6 +113,71 @@ CloudTrail trail, …). The migration from in-tree to plugin preserves
 every URN. See
 [`04-no-destroy-invariant.md`](https://github.com/simple-container-com/forge/blob/main/docs/design/2026-10-24/sc-plugin-architecture/04-no-destroy-invariant.md).
 
+## Component resource naming on `aws-lambda`
+
+A parent stack can host several SC Components dispatched into the
+`aws-lambda` template. Every resource and export the template creates
+is therefore named per Component:
+
+| | client-stack deploy | Component dispatch |
+|---|---|---|
+| ECR repository | `<stack>-<stack>-ecr` | `<stack>-<component>-ecr` |
+| execution role | `<stack>-execution-role` | `<stack>-<component>-execution-role` |
+| function | `<stack>-callback` | `<stack>-<component>-callback` |
+| log group | `<stack>-access-logs` | `<stack>-<component>-access-logs` |
+| SecretsManager | `<stack>--<env>--…` | `<stack>-<component>--<env>--…` |
+| URL export | `<stack>-<env>-function-url` | `<stack>-<component>-<env>-function-url` |
+
+A client-stack deploy keeps the bare stack name and always will: every
+deployed lambda's Pulumi state entries, AWS physical names and
+`<stack>-<env>-function-url` export are keyed on it.
+
+Before this scoping existed the template derived all of the above from
+the stack name alone, so a parent stack could host exactly **one**
+Component dispatched into `aws-lambda`. A second one collided on every
+name — loudest on the ECR repository (`Duplicate resource URN
+…::Repository::<stack>-<stack>`), and silently on the URL export (a map
+set, so the last dispatch wins: two Components, one DNS target) and on
+SecretsManager (two Components mapping a field to the same env var
+share one secret, last writer winning).
+
+### `legacyResourceNames: true`
+
+Switching an ALREADY-DEPLOYED Component onto the scoped names is a pure
+rename, and Pulumi matches resources by name — so the plan is an
+independent create plus an independent **delete** of each live resource,
+which SC core's destructive-rename guard refuses. Declare the flag on
+that Component to keep its existing names:
+
+```yaml
+# .sc/stacks/<parent>/server.yaml
+resources:
+  resources:
+    staging:
+      resources:
+        my-backup:
+          type: sc-backup
+          config:
+            deployTo: lambda
+            # Deployed before per-Component naming existed; keep the
+            # un-scoped names so this provision is not a rename.
+            legacyResourceNames: true
+```
+
+Any Component added afterwards gets scoped names and no longer collides
+with it. Only declare it on a Component that is already live — on a new
+one it puts it straight back into collision with the grandfathered one.
+
+Dropping the flag later is a deliberate choice to take the replace: a
+new Function URL (SC core rewires `ingress.hostname` in the same update)
+and a fresh log group. Nothing stateful moves, because buckets and
+databases are separate resources.
+
+The flag must also appear in the Component plugin's
+`ComponentAllowedOverrides` for its resource type — SC core dual-uses
+that list as the allowed-top-level-keys validator for the component
+config, even though the key is read here rather than by that plugin.
+
 ## Optional ECS hardening (S-03, S-12, S-13)
 
 All flags below default to `false`. An unchanged existing stack keeps the
