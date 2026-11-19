@@ -326,6 +326,26 @@ func (p *awsPlugin) Provision(ctx context.Context, req *scpluginv1.ProvisionRequ
 		StackParams: &api.StackParams{
 			StackName:   cliStackName,
 			Environment: req.GetHeader().GetEnvironment(),
+			// The deploy version, off the bus header (api#640).
+			//
+			// This field was unset here, and it is the input to the
+			// VERSION build-arg SC injects on every image:
+			//
+			//	version: lo.If(deployParams.Version != "", …).Else("latest")
+			//
+			// So every plugin-deployed image was built with
+			// VERSION=latest, and any Dockerfile doing
+			// `-ldflags "-X main.version=${VERSION}"` baked the literal
+			// string "latest". Live-caught 2026-11-19 on forge-storage,
+			// whose /healthz reported "latest" while the same run logged
+			// `Deploy version: 2026.11.19-fecb8f8`. An ECR tag from June
+			// (…-ecr:2026.06.02-9615b8b) shows it worked before the
+			// plugin split, so this was a regression, not a gap.
+			//
+			// Empty against an older SC core, which is the behaviour this
+			// replaces — so the fallback stays correct rather than
+			// becoming a hard dependency on the core version.
+			Version: req.GetHeader().GetDeployVersion(),
 		},
 		ComponentRaw: componentRaw,
 	}
