@@ -597,15 +597,34 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		// Add permissions to allow anonymous invocation via function URL
 		// AWS requires BOTH lambda:InvokeFunctionUrl AND lambda:InvokeFunction permissions
 		// for Function URLs with AuthorizationType: "NONE" to work properly
+		//
+		// These three resources — the FunctionUrl and both Permissions —
+		// are SERIALIZED, not run in parallel. All three mutate the same
+		// Lambda's resource policy (pulumi-aws's FunctionUrl create
+		// issues an AddPermission of its own), and Lambda refuses
+		// concurrent updates to one function:
+		//
+		//	adding Lambda Function URL (…-callback-9fe22ae) permission:
+		//	operation error Lambda: AddPermission, StatusCode: 409,
+		//	ResourceConflictException: The function could not be updated
+		//	due to a concurrent update operation.
+		//
+		// Live-caught 2026-11-19 provisioning the second Component on
+		// forge/infra (forge run 44472020656). It is a race, so it had
+		// been passing by luck: three AddPermission calls fired at once
+		// against a function created moments earlier. Chaining them
+		// costs two sequential API calls on first create and nothing
+		// afterwards, which is the right trade against a deploy that
+		// fails roughly whenever AWS is slow.
 
 		// Permission 1: lambda:InvokeFunctionUrl with FunctionUrlAuthType condition
 		urlPermissionName := fmt.Sprintf("%s-url-permission", lambdaName)
-		_, err = lambda.NewPermission(ctx, urlPermissionName, &lambda.PermissionArgs{
+		urlPermission, err := lambda.NewPermission(ctx, urlPermissionName, &lambda.PermissionArgs{
 			Action:              sdk.String("lambda:InvokeFunctionUrl"),
 			Function:            lambdaFunc.Name,
 			Principal:           sdk.String("*"),
 			FunctionUrlAuthType: sdk.String("NONE"),
-		}, opts...)
+		}, append(opts, sdk.DependsOn([]sdk.Resource{functionUrl}))...)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create lambda function url permission")
 		}
@@ -619,7 +638,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 			Principal: sdk.String("*"),
 			// Note: Pulumi doesn't support lambda:InvokedViaFunctionUrl condition yet
 			// This permission allows invocation through function URL
-		}, opts...)
+		}, append(opts, sdk.DependsOn([]sdk.Resource{urlPermission}))...)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create lambda function url permission")
 		}
