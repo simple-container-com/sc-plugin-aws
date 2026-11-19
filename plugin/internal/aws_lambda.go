@@ -85,6 +85,44 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		}
 	}
 
+	// resScope is the name prefix for EVERY AWS resource and stack
+	// export this template produces.
+	//
+	// For a client-stack deploy it is the stack name, and it MUST stay
+	// that: every existing deployment's Pulumi state entries and
+	// physical resource names (the ECR repository, the execution role,
+	// the function, the log group, the `<stack>-<env>-function-url`
+	// export every `uses:` consumer resolves) are keyed on it. Changing
+	// it there would replace the whole fleet.
+	//
+	// For a Component dispatch it is `<stack>-<component>`, because a
+	// PARENT stack can host N Components dispatched into this same
+	// template. With the stack name alone, the second Component
+	// collides with the first on every name above — the ECR repository
+	// first and loudest:
+	//
+	//	error: Duplicate resource URN
+	//	'urn:pulumi:infra::forge::aws:ecr/repository:Repository::infra-infra'
+	//
+	// and, had it got past that, silently on the
+	// `<stack>-<env>-function-url` export (a map set, so last writer
+	// wins) — which is the value SC core resolves to point a
+	// Component's `ingress.hostname` at. Two Components would have
+	// fought over one DNS target with no error at all.
+	//
+	// Live-caught 2026-11-19 declaring `my-observatory` alongside the
+	// already-deployed `my-backup` on forge/infra (forge run
+	// 44463662474). The ecs-fargate path already scopes per container
+	// (`stack.Name + "/" + container.Name`); this brings the lambda
+	// path to the same footing.
+	componentName := lambdaComponentName(input)
+	resScope := lambdaResourceScope(stack.Name, componentName)
+	if componentName != "" {
+		params.Log.Info(ctx.Context(),
+			"lambda component dispatch: scoping resource names to %q (component %q on parent stack %q)",
+			resScope, componentName, stack.Name)
+	}
+
 	awsCloudExtras := &aws.CloudExtras{}
 	if stackConfig.CloudExtras != nil {
 		var err error
@@ -126,7 +164,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 	buildArgs := lo.FromPtr(stackConfig.Image.Build).Args
 	if stackConfig.Image.Name != "" && dockerfilePath == "" && buildContext == "" {
 		params.Log.Info(ctx.Context(), "lambda: rewrapping pre-built image %q via a FROM-only Dockerfile pushed to ECR", stackConfig.Image.Name)
-		tmpDir, err := os.MkdirTemp("", fmt.Sprintf("sc-aws-lambda-rewrap-%s-", stack.Name))
+		tmpDir, err := os.MkdirTemp("", fmt.Sprintf("sc-aws-lambda-rewrap-%s-", resScope))
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create tmpdir for rewrap Dockerfile")
 		}
@@ -141,8 +179,21 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		buildArgs["SOURCE_IMAGE"] = stackConfig.Image.Name
 	}
 
+	// The image/ECR name is the one place resScope is NOT the right
+	// input: createEcrRegistry already prefixes with the stack name
+	// (`<stack>-<name>` → `awsResName` → `<stack>-<name>-ecr`), so
+	// handing it resScope yields `infra-infra-my-backup-ecr`. Hand it
+	// the bare component name instead and the repository reads
+	// `infra-my-backup-ecr` — unique within the stack, and legible in
+	// an ECR console listing, which is where an operator meets it.
+	// Non-component deploys keep passing stack.Name, so their existing
+	// `<stack>-<stack>-ecr` repository is untouched.
+	imageName := resScope
+	if componentName != "" {
+		imageName = componentName
+	}
 	image, err := buildAndPushDockerImageV2(ctx, stack, params, deployParams, dockerImage{
-		name:       stack.Name,
+		name:       imageName,
 		dockerfile: dockerfilePath,
 		context:    buildContext,
 		args:       buildArgs,
@@ -161,7 +212,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 	})
 
 	// Create IAM Role for Lambda Function
-	lambdaExecutionRoleName := fmt.Sprintf("%s-execution-role", stack.Name)
+	lambdaExecutionRoleName := fmt.Sprintf("%s-execution-role", resScope)
 	params.Log.Info(ctx.Context(), "configure lambda execution role %q for %q in %q...", lambdaExecutionRoleName, stack.Name, deployParams.Environment)
 	lambdaExecutionRole, err := iam.NewRole(ctx, lambdaExecutionRoleName, &iam.RoleArgs{
 		Tags:                tags,
@@ -182,7 +233,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 	}
 
 	// Attach the necessary AWS managed policies to the role created
-	rolePolicyAttachmentName := fmt.Sprintf("%s-policy-attachment", stack.Name)
+	rolePolicyAttachmentName := fmt.Sprintf("%s-policy-attachment", resScope)
 	params.Log.Info(ctx.Context(), "configure role policy attachment %q for %q in %q...", rolePolicyAttachmentName, stack.Name, deployParams.Environment)
 	_, err = iam.NewRolePolicyAttachment(ctx, rolePolicyAttachmentName, &iam.RolePolicyAttachmentArgs{
 		Role:      lambdaExecutionRole.Name,
@@ -208,7 +259,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 	}
 	params.Log.Info(ctx.Context(), "adding extra roles %q for lambda %q...", strings.Join(awsCloudExtras.AwsRoles, ","), stack.Name)
 	lambdaRoles = append(lambdaRoles, awsCloudExtras.AwsRoles...)
-	extraPolicyName := fmt.Sprintf("%s-xpolicy", stack.Name)
+	extraPolicyName := fmt.Sprintf("%s-xpolicy", resScope)
 	params.Log.Info(ctx.Context(), "configure extra policy %q for %q in %q...", extraPolicyName, stack.Name, deployParams.Environment)
 	extraPolicy, err := iam.NewPolicy(ctx, extraPolicyName, &iam.PolicyArgs{
 		Description: sdk.String(fmt.Sprintf("Allows reading secrets in lambda for stack %s", stack.Name)),
@@ -236,7 +287,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		return nil, errors.Wrapf(err, "failed to create extra policy for lambda role")
 	}
 
-	extraPolicyAttachmentName := fmt.Sprintf("%s-xp-attach", stack.Name)
+	extraPolicyAttachmentName := fmt.Sprintf("%s-xp-attach", resScope)
 	params.Log.Info(ctx.Context(), "configure IAM policy attachment %q for %q in %q...", extraPolicyAttachmentName, stack.Name, deployParams.Environment)
 	_, err = iam.NewRolePolicyAttachment(ctx, extraPolicyAttachmentName, &iam.RolePolicyAttachmentArgs{
 		Role:      lambdaExecutionRole.Name,
@@ -259,6 +310,28 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 	//     service's bootstrap calls `awsutil.LoadSecretBundle(ctx)`
 	//     (SDK) to parse + os.Setenv each key before anything reads
 	//     a secret env. ~16× budget headroom vs the per-key path.
+	// SecretsManager names are built from StackParams.StackName
+	// (toSecretName → `<stack>--<env>--<resType>--<resName>--<var>`),
+	// so they collide between Components for exactly the same reason
+	// the resource names above did — and worse than a loud duplicate
+	// URN: two Components that each map a field to the same env var
+	// (`signingKey → SERVICE_JWT_SECRET` is the fleet's own convention,
+	// declared by both sc-backup and sc-observatory) would resolve to
+	// ONE SecretsManager secret, and whichever provisioned last would
+	// overwrite the other's value. Both services would then validate
+	// JWTs with the same key while believing they had their own.
+	//
+	// Scope via a local StackParams copy so `toSecretName` is reached
+	// with the component-qualified name, without changing its
+	// signature or the ecs-fargate / alerts callers. Tags and env
+	// variables keep deriving from the REAL deployParams — a resource's
+	// owning stack is still `infra`, and `SIMPLE_CONTAINER_STACK_NAME`
+	// must keep reporting the stack the service was deployed from.
+	secretParams := deployParams
+	if componentName != "" {
+		secretParams.StackName = resScope
+	}
+
 	var secrets []*CreatedSecret
 	if cloudExtras.SecretsBundle.IsEnabled() {
 		// Bundle mode. Build the same {envName → plaintext} set the
@@ -268,7 +341,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		for _, v := range secretEnvVariables {
 			ctxVars = append(ctxVars, secretValue{Name: v.Name, Value: v.Value})
 		}
-		bundle, berr := createSecretsBundle(ctx, deployParams, cloudExtras.SecretsBundle, ctxVars, stackConfig.Secrets, tags, opts...)
+		bundle, berr := createSecretsBundle(ctx, secretParams, cloudExtras.SecretsBundle, ctxVars, stackConfig.Secrets, tags, opts...)
 		if berr != nil {
 			return nil, errors.Wrapf(berr, "failed to create secrets bundle for stack %q in %q", stack.Name, deployParams.Environment)
 		}
@@ -278,14 +351,14 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 			len(ctxVars)+len(stackConfig.Secrets), bundleEnvName, stack.Name, deployParams.Environment)
 	} else {
 		ctxSecrets, cerr := util.MapErr(secretEnvVariables, func(v pApi.ComputeEnvVariable, _ int) (*CreatedSecret, error) {
-			return createSecret(ctx, toSecretName(deployParams, v.ResourceType, v.ResourceName, v.Name, stackConfig.Version), v.Name, v.Value, tags, opts...)
+			return createSecret(ctx, toSecretName(secretParams, v.ResourceType, v.ResourceName, v.Name, stackConfig.Version), v.Name, v.Value, tags, opts...)
 		})
 		if cerr != nil {
 			return nil, errors.Wrapf(cerr, "failed to create context secrets for stack %q in %q", stack.Name, deployParams.Environment)
 		}
 		secrets = append(secrets, ctxSecrets...)
 		for name, value := range stackConfig.Secrets {
-			s, serr := createSecret(ctx, toSecretName(deployParams, "values", "", name, stackConfig.Version), name, value, tags, opts...)
+			s, serr := createSecret(ctx, toSecretName(secretParams, "values", "", name, stackConfig.Version), name, value, tags, opts...)
 			if serr != nil {
 				return nil, errors.Wrapf(serr, "failed to create secret")
 			}
@@ -334,7 +407,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		envVariables[name] = sdk.String(value)
 	}
 
-	accessLogGroupName := fmt.Sprintf("%s-access-logs", stack.Name)
+	accessLogGroupName := fmt.Sprintf("%s-access-logs", resScope)
 	params.Log.Info(ctx.Context(), "configure cloudwatch access log group for %q in %q...", stack.Name, deployParams.Environment)
 	logGroup, err := cloudwatch.NewLogGroup(ctx, accessLogGroupName, &cloudwatch.LogGroupArgs{
 		Name: sdk.String(accessLogGroupName),
@@ -344,7 +417,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		return nil, errors.Wrapf(err, "failed to create access logs group for api gateway")
 	}
 
-	lambdaName := fmt.Sprintf("%s-callback", stack.Name)
+	lambdaName := fmt.Sprintf("%s-callback", resScope)
 	lambdaFuncArgs := lambda.FunctionArgs{
 		PackageType: sdk.String("Image"),
 		Role:        lambdaExecutionRole.Arn,
@@ -389,13 +462,13 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create lambda function")
 	}
-	ctx.Export(fmt.Sprintf("%s-%s-lambda-arn", stack.Name, deployParams.Environment), lambdaFunc.Arn)
+	ctx.Export(fmt.Sprintf("%s-%s-lambda-arn", resScope, deployParams.Environment), lambdaFunc.Arn)
 	opts = append(opts, sdk.DependsOn([]sdk.Resource{lambdaFunc}))
 
 	if lambdaRoutingType == aws.LambdaRoutingApiGw {
 		// Create an HTTP API Gateway for the Lambda Function
 		params.Log.Info(ctx.Context(), "configure API gateway for %q in %q...", stack.Name, deployParams.Environment)
-		apiGwName := fmt.Sprintf("%s-api-gw", stack.Name)
+		apiGwName := fmt.Sprintf("%s-api-gw", resScope)
 		apiGw, err := apigatewayv2.NewApi(ctx, apiGwName, &apigatewayv2.ApiArgs{
 			Name: sdk.String(apiGwName),
 			// RouteKey:     sdk.String("$default"), // TODO: figure out whether this will work
@@ -408,7 +481,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 
 		// Create an integration between the HTTP API Gateway and the Lambda Function
 		params.Log.Info(ctx.Context(), "configure API gateway lambda integration for %q in %q...", stack.Name, deployParams.Environment)
-		integration, err := apigatewayv2.NewIntegration(ctx, fmt.Sprintf("%s-api-lambda-integration", stack.Name),
+		integration, err := apigatewayv2.NewIntegration(ctx, fmt.Sprintf("%s-api-lambda-integration", resScope),
 			&apigatewayv2.IntegrationArgs{
 				ApiId:           apiGw.ID(),
 				IntegrationType: sdk.String("AWS_PROXY"),
@@ -420,7 +493,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 
 		// Create a route for the HTTP API Gateway for invoking the Lambda Function
 		params.Log.Info(ctx.Context(), "configure API gateway route for %q in %q...", stack.Name, deployParams.Environment)
-		routeName := fmt.Sprintf("%s-route", stack.Name)
+		routeName := fmt.Sprintf("%s-route", resScope)
 		route, err := apigatewayv2.NewRoute(ctx, routeName, &apigatewayv2.RouteArgs{
 			ApiId:         apiGw.ID(),
 			OperationName: sdk.String("ANY"),
@@ -434,7 +507,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		}
 
 		// Grant the API Gateway permission to invoke the Lambda function
-		_, err = lambda.NewPermission(ctx, fmt.Sprintf("%s-permission", stack.Name), &lambda.PermissionArgs{
+		_, err = lambda.NewPermission(ctx, fmt.Sprintf("%s-permission", resScope), &lambda.PermissionArgs{
 			Action:    sdk.String("lambda:InvokeFunction"),
 			Function:  lambdaFunc.Arn,
 			Principal: sdk.String("apigateway.amazonaws.com"),
@@ -449,7 +522,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 
 		// Define the stage. This is the URL path where your API will be accessible
 		params.Log.Info(ctx.Context(), "configure API gateway stage for %q in %q...", stack.Name, deployParams.Environment)
-		_, err = apigatewayv2.NewStage(ctx, fmt.Sprintf("%s-http-stage", stack.Name), &apigatewayv2.StageArgs{
+		_, err = apigatewayv2.NewStage(ctx, fmt.Sprintf("%s-http-stage", resScope), &apigatewayv2.StageArgs{
 			ApiId: apiGw.ID(),
 			Name:  sdk.String(lo.If(stackConfig.BasePath == "", "api").Else(stackConfig.BasePath)),
 			Tags:  tags,
@@ -466,7 +539,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 			return nil, errors.Wrapf(err, "failed to create API gateway stage")
 		}
 
-		ctx.Export(fmt.Sprintf("%s-%s-function-url", stack.Name, deployParams.Environment), apiGw.ApiEndpoint)
+		ctx.Export(fmt.Sprintf("%s-%s-function-url", resScope, deployParams.Environment), apiGw.ApiEndpoint)
 		// Component-dispatch convention (api PR #635, v>=TBD): publish
 		// the Lambda's public URL under the standardized key so SC core
 		// can wire DNS for a Component declaring ingress.hostname. SC
@@ -524,7 +597,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create lambda function url permission")
 		}
-		ctx.Export(fmt.Sprintf("%s-%s-function-url", stack.Name, deployParams.Environment), functionUrl.FunctionUrl)
+		ctx.Export(fmt.Sprintf("%s-%s-function-url", resScope, deployParams.Environment), functionUrl.FunctionUrl)
 		// Component-dispatch convention (api PR #635, v>=TBD): publish
 		// the Function URL under the standardized key so SC core can
 		// wire DNS for a Component declaring ingress.hostname. See
@@ -578,7 +651,8 @@ func provisionDNSForLambda(ctx *sdk.Context, stack api.Stack, params pApi.Provis
 				"ensure SC core is recent enough to strip ingress.hostname " +
 				"before dispatch and wire DNS itself via " +
 				"ComponentEndpointURLKey; see " +
-				"forge/docs/design/2026-11-17/component-parent-dns-wiring/")
+				"forge/docs/design/2026-11-17/component-parent-dns-wiring/",
+		)
 	}
 	// the lambda function URL is a full URL, the registrar wants a bare hostname
 	endpointHost := endpointUrl.ApplyT(func(epUrl string) (string, error) {
@@ -641,4 +715,36 @@ func provisionScheduleForLambda(ctx *sdk.Context, stack api.Stack, params pApi.P
 		return errors.Wrapf(err, "failed to create permission for schedule to invoke lambda")
 	}
 	return nil
+}
+
+// lambdaComponentName returns the Component resource name when this
+// provision is a Component dispatch, and "" for an ordinary
+// client-stack deploy.
+//
+// Both conditions matter. ComponentRaw is the side-channel SC core
+// populates only on dispatch, so it is the authoritative signal;
+// Descriptor.Name alone is set on every provision (it is the template
+// name for a client stack) and keying on it would re-scope — and thus
+// replace — every deployed lambda in the fleet.
+func lambdaComponentName(input api.ResourceInput) string {
+	if input.ComponentRaw == nil || input.Descriptor == nil {
+		return ""
+	}
+	return input.Descriptor.Name
+}
+
+// lambdaResourceScope is the prefix for every resource name, physical
+// name and stack export the aws-lambda template emits.
+//
+// Kept as a pure function so the naming contract is pinned by a test
+// rather than only by a live deploy: the client-stack case must return
+// the bare stack name forever (every existing Pulumi state entry and
+// AWS physical name depends on it), and the Component case must differ
+// per component (see the long comment at the call site for what
+// collides otherwise).
+func lambdaResourceScope(stackName, componentName string) string {
+	if componentName == "" {
+		return stackName
+	}
+	return fmt.Sprintf("%s-%s", stackName, componentName)
 }
