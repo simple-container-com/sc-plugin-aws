@@ -73,3 +73,36 @@ func TestLambdaComponentName_RequiresComponentRaw(t *testing.T) {
 		ComponentRaw: map[string]any{"deployTo": "lambda"},
 	})).To(BeEmpty())
 }
+
+// TestLambdaWantsLegacyResourceNames covers the grandfather flag.
+//
+// The string spellings are not pedantry. A quoted `legacyResourceNames:
+// "true"` that silently read as false would turn the next provision of
+// an already-deployed Component into a rename — i.e. an independent
+// create plus a DELETE of its live Lambda. Accepting the string shapes
+// is cheaper than that failure, and the flag only ever has to err
+// toward "keep the live resources".
+func TestLambdaWantsLegacyResourceNames(t *testing.T) {
+	RegisterTestingT(t)
+
+	Ω(lambdaWantsLegacyResourceNames(api.ResourceInput{})).To(BeFalse())
+	Ω(lambdaWantsLegacyResourceNames(api.ResourceInput{
+		ComponentRaw: map[string]any{},
+	})).To(BeFalse())
+	Ω(lambdaWantsLegacyResourceNames(api.ResourceInput{
+		ComponentRaw: map[string]any{"legacyResourceNames": false},
+	})).To(BeFalse())
+
+	for _, truthy := range []any{true, "true", "True", "TRUE", "1"} {
+		Ω(lambdaWantsLegacyResourceNames(api.ResourceInput{
+			ComponentRaw: map[string]any{"legacyResourceNames": truthy},
+		})).To(BeTrue(), "%v should enable legacy names", truthy)
+	}
+
+	// A shape that is neither bool nor a truthy string must not enable
+	// it — defaulting to legacy names on a NEW component would put it
+	// back in collision with the grandfathered one.
+	Ω(lambdaWantsLegacyResourceNames(api.ResourceInput{
+		ComponentRaw: map[string]any{"legacyResourceNames": 1},
+	})).To(BeFalse())
+}

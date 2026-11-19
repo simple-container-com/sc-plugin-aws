@@ -116,6 +116,32 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 	// (`stack.Name + "/" + container.Name`); this brings the lambda
 	// path to the same footing.
 	componentName := lambdaComponentName(input)
+	if lambdaWantsLegacyResourceNames(input) {
+		// Grandfather: this Component was deployed BEFORE the scoping
+		// above existed, so its live resources are named from the stack
+		// alone. Turning scoping on for it is a pure rename, and Pulumi
+		// matches by name — so the plan would be an independent create
+		// plus an independent DELETE of each live resource. SC core's
+		// own destructive-rename guard refuses that plan, correctly
+		// (forge run 44466834062 listed 14 resources, including the
+		// live Lambda serving backup.simple-forge.com).
+		//
+		// So the FIRST Component on a stack keeps its names by
+		// declaring this, and every later one gets scoped names and
+		// does not collide with it. The operator pays one documented
+		// line on exactly the one grandfathered resource rather than a
+		// reviewed-destroy deploy, and `SC_ALLOW_DESTRUCTIVE_REPLACE`
+		// stays unspent — an escape hatch used routinely stops being
+		// read.
+		//
+		// Dropping the flag later is a deliberate choice to take the
+		// replace (new Function URL, fresh log group; nothing stateful
+		// moves, since buckets and databases are separate resources).
+		params.Log.Info(ctx.Context(),
+			"lambda component %q: legacyResourceNames set — keeping un-scoped names derived from stack %q",
+			componentName, stack.Name)
+		componentName = ""
+	}
 	resScope := lambdaResourceScope(stack.Name, componentName)
 	if componentName != "" {
 		params.Log.Info(ctx.Context(),
@@ -747,4 +773,29 @@ func lambdaResourceScope(stackName, componentName string) string {
 		return stackName
 	}
 	return fmt.Sprintf("%s-%s", stackName, componentName)
+}
+
+// lambdaWantsLegacyResourceNames reports whether the operator asked
+// this Component to keep the pre-scoping resource names.
+//
+// Only meaningful on a Component dispatch; a client-stack deploy is
+// never scoped in the first place, so the flag is ignored there rather
+// than silently accepted as if it did something.
+//
+// Accepts a real bool or the string spellings YAML produces when a
+// value arrives quoted, because `legacyResourceNames: "true"` failing
+// SILENTLY would mean a destroyed Lambda — the one failure mode this
+// flag exists to prevent.
+func lambdaWantsLegacyResourceNames(input api.ResourceInput) bool {
+	if input.ComponentRaw == nil {
+		return false
+	}
+	switch v := input.ComponentRaw["legacyResourceNames"].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(v, "true") || v == "1"
+	default:
+		return false
+	}
 }
