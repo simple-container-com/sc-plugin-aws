@@ -367,7 +367,7 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		for _, v := range secretEnvVariables {
 			ctxVars = append(ctxVars, secretValue{Name: v.Name, Value: v.Value})
 		}
-		bundle, berr := createSecretsBundle(ctx, secretParams, cloudExtras.SecretsBundle, ctxVars, stackConfig.Secrets, tags, opts...)
+		bundle, berr := createSecretsBundle(ctx, secretParams, cloudExtras.SecretsBundle, stackConfig.Version, ctxVars, stackConfig.Secrets, tags, opts...)
 		if berr != nil {
 			return nil, errors.Wrapf(berr, "failed to create secrets bundle for stack %q in %q", stack.Name, deployParams.Environment)
 		}

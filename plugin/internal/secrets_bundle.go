@@ -68,6 +68,10 @@ func createSecretsBundle(
 	ctx *sdk.Context,
 	deployParams api.StackParams,
 	cfg *aws.SecretsBundleConfig,
+	// versionSuffix is the operator's `config.version` — the opt-in
+	// "force a redeploy of the secrets" knob, normally EMPTY. It is NOT
+	// the deploy version.
+	versionSuffix string,
 	ctxVars []secretValue,
 	stackSecrets map[string]string,
 	tags sdk.StringMap,
@@ -107,7 +111,26 @@ func createSecretsBundle(
 
 	secretName := cfg.Name
 	if secretName == "" {
-		secretName = toSecretName(deployParams, "bundle", "", "secrets", deployParams.Version)
+		// The suffix is the OPERATOR's config.version, matching the
+		// per-key secrets in aws_lambda.go. It used to be
+		// deployParams.Version — the CalVer deploy version — which is a
+		// different field with different semantics: config.version is
+		// documented as "only when need to forcefully redeploy (e.g.
+		// aws secrets)" and is normally empty, while the deploy version
+		// changes on EVERY deploy.
+		//
+		// That was dormant only because the deploy version never
+		// reached a plugin (the bus carried no version field until
+		// api#640). The moment it did, this secret's NAME changed on
+		// every deploy — and Pulumi matches by name, so each deploy
+		// planned an independent create plus a DELETE of the live
+		// secret. SC core's destructive-rename guard refused it, which
+		// is how it surfaced: forge-conductor's deploy, the first
+		// service to use the bundle after the version fix landed.
+		//
+		// Left as-is it would have churned one new AWS secret per
+		// deploy, forever, on every service using a bundle.
+		secretName = toSecretName(deployParams, "bundle", "", "secrets", versionSuffix)
 	}
 
 	args := &secretsmanager.SecretArgs{

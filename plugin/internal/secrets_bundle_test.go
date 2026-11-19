@@ -5,9 +5,12 @@ package aws
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/simple-container-com/api/pkg/api"
 )
 
 // TestBuildBundlePayload_MergesBothSources pins the contract that the
@@ -72,4 +75,51 @@ func TestBuildBundlePayload_SerialisesStably(t *testing.T) {
 	raw, err := json.Marshal(payload)
 	assert.NoError(t, err)
 	assert.Equal(t, `{"A":"1","B":"2","C":"3"}`, string(raw))
+}
+
+// TestBundleSecretName_IgnoresDeployVersion is the guard for a rename
+// that would otherwise happen on EVERY deploy.
+//
+// The bundle secret's name suffix is the OPERATOR's `config.version` —
+// documented as "only when need to forcefully redeploy (e.g. aws
+// secrets)" and normally empty — matching the per-key secrets in
+// aws_lambda.go. It used to be deployParams.Version, the CalVer deploy
+// version, which is a different field that changes on every deploy.
+//
+// Dormant only because the deploy version never reached a plugin (the
+// bus carried no version field until api#640). The moment it did,
+// forge-conductor's deploy failed:
+//
+//	destructive delete by rename: preview would DELETE 1 live resource(s)
+//	  …Secret::forge-conductor--staging--bundle----secrets would be DELETED;
+//	  the plan creates …--bundle----secrets2026.11.19-713bb2e instead
+//
+// Pulumi matches by name, so that is an independent create plus a
+// delete of the live secret — not a replace the engine reconciles.
+func TestBundleSecretName_IgnoresDeployVersion(t *testing.T) {
+	params := api.StackParams{
+		StackName:   "forge-conductor",
+		Environment: "staging",
+		// A deploy version is present on every CI deploy now.
+		Version: "2026.11.19-713bb2e",
+	}
+
+	// No operator config.version → stable name across deploys.
+	stable := toSecretName(params, "bundle", "", "secrets", "")
+	if strings.Contains(stable, "2026.11.19") {
+		t.Errorf("name %q embeds the deploy version — it would rename on every deploy", stable)
+	}
+
+	// Two different deploy versions must produce the SAME name.
+	params2 := params
+	params2.Version = "2026.11.20-aaaaaaa"
+	if other := toSecretName(params2, "bundle", "", "secrets", ""); other != stable {
+		t.Errorf("name changed with the deploy version: %q vs %q", stable, other)
+	}
+
+	// The operator's own knob still rotates it — that is its purpose.
+	rotated := toSecretName(params, "bundle", "", "secrets", "v2")
+	if rotated == stable {
+		t.Error("config.version did not change the name; the force-rotate knob is dead")
+	}
 }
