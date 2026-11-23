@@ -296,6 +296,65 @@ IAM identities. With the legacy shared execution/task role, workloads can still
 read task secrets through AWS APIs. Combine with `leastPrivilegeRoles` and avoid
 granting the runtime role secret-read actions when that access is unnecessary.
 
+## Lambda concurrency (`reservedConcurrency`, `provisionedConcurrency`)
+
+Two opt-in knobs on `cloudExtras` cap or pre-warm an `aws-lambda` function.
+Both default **unset** — an existing stack sees no resource change until an
+operator declares one.
+
+```yaml
+# .sc/stacks/<service>/client.yaml
+stacks:
+  staging:
+    type: single-image
+    parent: <org>/<parent>
+    config:
+      image:
+        dockerfile: Dockerfile
+      cloudExtras:
+        # Cap this function at 10 simultaneous executions (AWS default:
+        # shares the account-wide pool). No ongoing cost.
+        reservedConcurrency: 10
+
+        # Keep 2 warm containers permanently alive to eliminate cold
+        # starts. Bills per container-GB-second even when idle.
+        provisionedConcurrency: 2
+```
+
+| Knob | Purpose | Cost | When to use |
+| --- | --- | --- | --- |
+| `reservedConcurrency` | Caps simultaneous executions. 0 disables the function (AWS refuses every invocation — deliberate kill-switch); ≥1 is a hard cap; unset = AWS unreserved (shares the account-wide pool). | **None** — scheduler hint only. | Protect downstream services from a stampede, or bound this function's share of the account-wide 1000-concurrent default. The go-embedb 2026-11-23 AWS smoke hit `reservedConcurrency=10` under a 50-RPS load and the overflow landed in the Function URL queue — a sizing choice, not a bug. |
+| `provisionedConcurrency` | Keeps N warm containers permanently alive. Requires a versioned alias; the plugin publishes the function version, creates `lambda.Alias` named `live` and `lambda.ProvisionedConcurrencyConfig`, and re-targets the Function URL / API Gateway integration at the alias. | **Ongoing** — AWS bills ~$0.015/GB-hour even when idle (so a 128 MB function kept at 2 warm ≈ $5.50/month). | Predictable baseline load where cold-start p99 is the user-visible pain. For bursty traffic reach for provisioning only after reservedConcurrency confirms the ceiling matches demand. |
+
+**Interaction.** When both are set, `reservedConcurrency` must be **≥**
+`provisionedConcurrency` — AWS requires the reserved pool to accommodate
+the warm fleet. The plugin does not enforce this at parse time; AWS
+validates it when the ProvisionedConcurrencyConfig is created and the
+deploy fails loudly, naming both values.
+
+**Alias lifecycle.** `provisionedConcurrency` creates a Lambda alias
+named `live` pinned to each deploy's just-published version
+(`lambda.Function.Publish: true`). The Function URL's `Qualifier`, the
+API Gateway integration's `IntegrationUri`, and every `lambda.Permission`
+for both routing modes take the alias — so warm containers serve public
+traffic and the resource policy applies to the versioned target the URL /
+APIGW actually calls. Removing `provisionedConcurrency` on a later deploy
+drops the alias, PCC and Qualifier in one update; the Function URL
+re-binds to `$LATEST` and existing deployments go back to the pre-knob
+shape.
+
+**Validation ranges** (parse-time, before Pulumi contacts AWS):
+
+| Value | `reservedConcurrency` | `provisionedConcurrency` |
+| --- | --- | --- |
+| **unset** | AWS unreserved (default) | no alias, no PCC (default) |
+| `0` | disable function (kill-switch) | **rejected** — use unset to turn it off |
+| `≥1` | hard cap | N warm containers |
+| negative | **rejected** | **rejected** |
+
+Both fields travel in the raw `stackConfig.cloudExtras` block, so this
+needs only the plugin release — no SC core change.
+
 ## ECS rolling-update percentages
 
 By default an `ecs-fargate` service deploys with `minimumHealthyPercent: 100`
