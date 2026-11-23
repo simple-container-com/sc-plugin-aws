@@ -48,6 +48,44 @@ type CloudExtras struct {
 	LambdaRoutingType LambdaRoutingType `json:"lambdaRoutingType" yaml:"lambdaRoutingType"`
 	LambdaInvokeMode  LambdaInvokeMode  `json:"lambdaInvokeMode" yaml:"lambdaInvokeMode"` // invoke mode for lambda
 
+	// Concurrency controls for aws-lambda. Both are opt-in; both nil keeps
+	// the template bit-identical to pre-knob deploys (AWS unreserved,
+	// $LATEST targeted by the Function URL / API Gateway).
+	//
+	// ReservedConcurrency caps simultaneous executions of this function at
+	// `*ReservedConcurrency` (maps to lambda.Function.ReservedConcurrentExecutions).
+	//
+	//   - nil → unreserved (AWS default: shares the account-wide pool).
+	//   - 0   → DISABLE the function (AWS returns throttle errors for every
+	//     invocation). Useful as a kill-switch; still set here deliberately,
+	//     not by accident.
+	//   - ≥1  → hard cap.
+	//
+	// No cost on its own — this is a scheduler hint, not provisioned
+	// capacity. Use it to protect downstream services from a stampede or
+	// to bound the account-pool share this function consumes.
+	//
+	// ProvisionedConcurrency keeps `*ProvisionedConcurrency` warm containers
+	// permanently alive so predictable load does not pay cold-start latency.
+	//
+	//   - nil → no provisioning (every invocation may cold-start).
+	//   - ≥1  → that many warm containers kept hot. Requires a published
+	//     Lambda version + alias; the plugin creates both automatically,
+	//     and re-targets the Function URL / API Gateway integration at the
+	//     alias. Zero is rejected (use nil instead).
+	//
+	// Costs money even when idle — AWS bills provisioned concurrency
+	// per container-GB-second (~$0.015/GB-hour us-east-1). Reach for it
+	// when cold-start p99 is the fleet pain point, not as a default.
+	//
+	// When both are set, `ReservedConcurrency` must be ≥ `ProvisionedConcurrency`
+	// (AWS requires the reserved pool to accommodate the warm fleet). The
+	// template does not enforce this at parse time — AWS validates it when
+	// the ProvisionedConcurrencyConfig is created and the deploy fails
+	// loudly with the offending pair.
+	ReservedConcurrency    *int `json:"reservedConcurrency,omitempty" yaml:"reservedConcurrency,omitempty"`
+	ProvisionedConcurrency *int `json:"provisionedConcurrency,omitempty" yaml:"provisionedConcurrency,omitempty"`
+
 	SecurityGroup    *SecurityGroup   `json:"securityGroup,omitempty" yaml:"securityGroup,omitempty"`
 	LoadBalancerType LoadBalancerType `json:"loadBalancerType,omitempty" yaml:"loadBalancerType,omitempty"` // default: alb
 

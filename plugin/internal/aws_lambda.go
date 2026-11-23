@@ -443,6 +443,14 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		return nil, errors.Wrapf(err, "failed to create access logs group for api gateway")
 	}
 
+	// Concurrency knobs — both opt-in. See aws.CloudExtras godoc for the
+	// semantics. Validated here rather than at parse time because the
+	// descriptor converter only round-trips shapes, not value ranges.
+	reservedConcurrency, provisionedConcurrency, wantsAlias, err := resolveLambdaConcurrency(cloudExtras)
+	if err != nil {
+		return nil, errors.Wrapf(err, "invalid lambda concurrency config for %q in %q", stack.Name, deployParams.Environment)
+	}
+
 	lambdaName := fmt.Sprintf("%s-callback", resScope)
 	lambdaFuncArgs := lambda.FunctionArgs{
 		PackageType: sdk.String("Image"),
@@ -462,6 +470,19 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		Environment: lambda.FunctionEnvironmentArgs{
 			Variables: envVariables,
 		},
+	}
+	if reservedConcurrency != nil {
+		// nil leaves AWS unreserved (default); setting it explicitly caps
+		// (or disables at 0) simultaneous executions.
+		lambdaFuncArgs.ReservedConcurrentExecutions = sdk.IntPtr(*reservedConcurrency)
+		params.Log.Info(ctx.Context(), "lambda %q: reservedConcurrency=%d", lambdaName, *reservedConcurrency)
+	}
+	if wantsAlias {
+		// ProvisionedConcurrencyConfig needs a numbered version (never
+		// $LATEST), so publish on every deploy. The alias below pins to
+		// the just-published version so the Function URL / APIGW target
+		// rolls forward atomically.
+		lambdaFuncArgs.Publish = sdk.Bool(true)
 	}
 
 	if lo.FromPtr(stackConfig.StaticEgressIP) {
@@ -491,6 +512,51 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 	ctx.Export(fmt.Sprintf("%s-%s-lambda-arn", resScope, deployParams.Environment), lambdaFunc.Arn)
 	opts = append(opts, sdk.DependsOn([]sdk.Resource{lambdaFunc}))
 
+	// invokeTarget is what the Function URL / APIGW integration / permissions
+	// bind against. Without provisioned concurrency it is the function itself
+	// at $LATEST (today's behaviour, unchanged). With provisioned concurrency
+	// it is the published alias — the Function URL carries a Qualifier, the
+	// APIGW integration carries the alias InvokeArn, and the permissions
+	// carry the alias name as their Qualifier so the resource policy applies
+	// to the versioned target the URL/APIGW actually hit.
+	invokeTarget := lambdaInvokeTarget{
+		invokeArn: lambdaFunc.InvokeArn,
+	}
+	if wantsAlias {
+		aliasName := fmt.Sprintf("%s-live", lambdaName)
+		params.Log.Info(ctx.Context(), "configure lambda alias %q (points at published version) for %q in %q...",
+			aliasName, stack.Name, deployParams.Environment)
+		lambdaAlias, aerr := lambda.NewAlias(ctx, aliasName, &lambda.AliasArgs{
+			Name:            sdk.String("live"),
+			FunctionName:    lambdaFunc.Name,
+			FunctionVersion: lambdaFunc.Version,
+			Description:     sdk.String("sc-plugin-aws: alias pinned by provisionedConcurrency"),
+		}, opts...)
+		if aerr != nil {
+			return nil, errors.Wrapf(aerr, "failed to create lambda alias for provisioned concurrency")
+		}
+		opts = append(opts, sdk.DependsOn([]sdk.Resource{lambdaAlias}))
+
+		pcName := fmt.Sprintf("%s-provisioned", lambdaName)
+		params.Log.Info(ctx.Context(), "configure lambda provisioned concurrency %q (%d warm) for %q in %q...",
+			pcName, *provisionedConcurrency, stack.Name, deployParams.Environment)
+		_, perr := lambda.NewProvisionedConcurrencyConfig(ctx, pcName, &lambda.ProvisionedConcurrencyConfigArgs{
+			FunctionName:                    lambdaFunc.Name,
+			Qualifier:                       lambdaAlias.Name,
+			ProvisionedConcurrentExecutions: sdk.Int(*provisionedConcurrency),
+		}, opts...)
+		if perr != nil {
+			return nil, errors.Wrapf(perr, "failed to create provisioned concurrency config")
+		}
+
+		// Route the Function URL / APIGW integration at the alias — this
+		// is the whole point of creating it. The alias is a qualifier on
+		// the SAME function (not a separate ARN), so permissions still
+		// reference the function name but carry the alias as Qualifier.
+		invokeTarget.invokeArn = lambdaAlias.InvokeArn
+		invokeTarget.qualifier = lambdaAlias.Name.ToStringPtrOutput()
+	}
+
 	if lambdaRoutingType == aws.LambdaRoutingApiGw {
 		// Create an HTTP API Gateway for the Lambda Function
 		params.Log.Info(ctx.Context(), "configure API gateway for %q in %q...", stack.Name, deployParams.Environment)
@@ -505,13 +571,16 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 			return nil, errors.Wrapf(err, "failed to create API gateway for lambda")
 		}
 
-		// Create an integration between the HTTP API Gateway and the Lambda Function
+		// Create an integration between the HTTP API Gateway and the Lambda Function.
+		// invokeTarget.invokeArn is lambdaFunc.InvokeArn by default and the
+		// alias InvokeArn when provisionedConcurrency is set, so the gateway
+		// hits the warm pool rather than $LATEST.
 		params.Log.Info(ctx.Context(), "configure API gateway lambda integration for %q in %q...", stack.Name, deployParams.Environment)
 		integration, err := apigatewayv2.NewIntegration(ctx, fmt.Sprintf("%s-api-lambda-integration", resScope),
 			&apigatewayv2.IntegrationArgs{
 				ApiId:           apiGw.ID(),
 				IntegrationType: sdk.String("AWS_PROXY"),
-				IntegrationUri:  lambdaFunc.InvokeArn,
+				IntegrationUri:  invokeTarget.invokeArn,
 			}, opts...)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create API gateway lambda integration")
@@ -532,10 +601,14 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 			return nil, errors.Wrapf(err, "failed to create API gateway route for lambda")
 		}
 
-		// Grant the API Gateway permission to invoke the Lambda function
+		// Grant the API Gateway permission to invoke the Lambda function.
+		// When provisionedConcurrency is on, the integration above targets the
+		// alias; Qualifier scopes this permission to the alias version so the
+		// resource policy matches the ARN the gateway actually calls.
 		_, err = lambda.NewPermission(ctx, fmt.Sprintf("%s-permission", resScope), &lambda.PermissionArgs{
 			Action:    sdk.String("lambda:InvokeFunction"),
 			Function:  lambdaFunc.Arn,
+			Qualifier: invokeTarget.qualifier,
 			Principal: sdk.String("apigateway.amazonaws.com"),
 			SourceArn: sdk.All(apiGw.ExecutionArn, route.RouteKey).ApplyT(func(args []any) string {
 				executionArn, _ := args[0], args[1]
@@ -585,10 +658,15 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 	} else if lambdaRoutingType == aws.LambdaRoutingFunctionUrl {
 		functionUrlName := fmt.Sprintf("%s-url", lambdaName)
 		params.Log.Info(ctx.Context(), "configure lambda function url for %q in %q...", stack.Name, deployParams.Environment)
+		// When provisionedConcurrency is on, Qualifier binds the URL to the
+		// alias, so warm containers serve public traffic instead of $LATEST
+		// paying cold-starts. Without it the URL stays on $LATEST, bit-
+		// identical to pre-knob deploys.
 		functionUrl, err := lambda.NewFunctionUrl(ctx, functionUrlName, &lambda.FunctionUrlArgs{
 			AuthorizationType: sdk.String("NONE"),
 			FunctionName:      lambdaFunc.Name,
 			InvokeMode:        sdk.String(invokeMode),
+			Qualifier:         invokeTarget.qualifier,
 		}, opts...)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create lambda function url")
@@ -617,11 +695,15 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 		// afterwards, which is the right trade against a deploy that
 		// fails roughly whenever AWS is slow.
 
-		// Permission 1: lambda:InvokeFunctionUrl with FunctionUrlAuthType condition
+		// Permission 1: lambda:InvokeFunctionUrl with FunctionUrlAuthType
+		// condition. Qualifier pins the resource policy to the alias when
+		// provisionedConcurrency is on — without it the policy would be on
+		// $LATEST and AWS would 403 the URL that targets the alias.
 		urlPermissionName := fmt.Sprintf("%s-url-permission", lambdaName)
 		urlPermission, err := lambda.NewPermission(ctx, urlPermissionName, &lambda.PermissionArgs{
 			Action:              sdk.String("lambda:InvokeFunctionUrl"),
 			Function:            lambdaFunc.Name,
+			Qualifier:           invokeTarget.qualifier,
 			Principal:           sdk.String("*"),
 			FunctionUrlAuthType: sdk.String("NONE"),
 		}, append(opts, sdk.DependsOn([]sdk.Resource{functionUrl}))...)
@@ -629,12 +711,14 @@ func Lambda(ctx *sdk.Context, stack api.Stack, input api.ResourceInput, params p
 			return nil, errors.Wrapf(err, "failed to create lambda function url permission")
 		}
 
-		// Permission 2: lambda:InvokeFunction with InvokedViaFunctionUrl condition
-		// This ensures function can only be invoked through the function URL
+		// Permission 2: lambda:InvokeFunction with InvokedViaFunctionUrl condition.
+		// This ensures function can only be invoked through the function URL.
+		// Same Qualifier rule as above when the alias is in play.
 		invokePermissionName := fmt.Sprintf("%s-invoke-permission", lambdaName)
 		_, err = lambda.NewPermission(ctx, invokePermissionName, &lambda.PermissionArgs{
 			Action:    sdk.String("lambda:InvokeFunction"),
 			Function:  lambdaFunc.Name,
+			Qualifier: invokeTarget.qualifier,
 			Principal: sdk.String("*"),
 			// Note: Pulumi doesn't support lambda:InvokedViaFunctionUrl condition yet
 			// This permission allows invocation through function URL
@@ -817,4 +901,49 @@ func lambdaWantsLegacyResourceNames(input api.ResourceInput) bool {
 	default:
 		return false
 	}
+}
+
+// lambdaInvokeTarget is what the Function URL / APIGW integration / each
+// Permission binds against. qualifier is nil (the interface zero value, so
+// the Pulumi SDK omits the field in the API call) when provisionedConcurrency
+// is off — keeping the deployed resource shape bit-identical to the pre-knob
+// template. Only when the alias exists does qualifier carry the alias name,
+// re-binding the whole URL/APIGW/permission chain to the versioned target.
+type lambdaInvokeTarget struct {
+	invokeArn sdk.StringInput
+	qualifier sdk.StringPtrInput
+}
+
+// resolveLambdaConcurrency validates the opt-in reservedConcurrency and
+// provisionedConcurrency fields on aws.CloudExtras and reports:
+//
+//   - reserved: value to pass to lambda.FunctionArgs.ReservedConcurrentExecutions.
+//     nil means do not set the field (AWS unreserved, the default).
+//   - provisioned: value to pass to ProvisionedConcurrencyConfig.
+//     nil means do not create the alias + ProvisionedConcurrencyConfig pair.
+//   - wantsAlias: shorthand for provisioned != nil — gates both the alias
+//     create AND the Publish=true flag on the function (provisioned
+//     concurrency requires a numbered version; $LATEST is refused).
+//
+// Kept as a pure function so the validation contract is pinned by unit
+// tests, not only by a live deploy — both fields are opt-in, and either
+// one silently defaulting is exactly the operator-visible failure mode
+// this template exists to avoid.
+func resolveLambdaConcurrency(ce aws.CloudExtras) (reserved, provisioned *int, wantsAlias bool, err error) {
+	if ce.ReservedConcurrency != nil {
+		rc := *ce.ReservedConcurrency
+		if rc < 0 {
+			return nil, nil, false, errors.Errorf("reservedConcurrency must be 0 (disable) or ≥1 (cap), got %d", rc)
+		}
+		reserved = &rc
+	}
+	if ce.ProvisionedConcurrency != nil {
+		pc := *ce.ProvisionedConcurrency
+		if pc < 1 {
+			return nil, nil, false, errors.Errorf("provisionedConcurrency must be ≥1 when set (omit or unset to disable), got %d", pc)
+		}
+		provisioned = &pc
+		wantsAlias = true
+	}
+	return reserved, provisioned, wantsAlias, nil
 }
