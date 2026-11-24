@@ -85,6 +85,20 @@ type awsPlugin struct {
 	broker *hplugin.GRPCBroker
 }
 
+// version is stamped by the release workflow via
+// `go build -ldflags "-X main.version=${VERSION}"` (release.yml:85).
+// The default `"dev"` is what a local `make build` or a test run sees.
+//
+// Historically this field did not exist and the PluginVersion below was
+// the literal `"aws-0.0.1"` — so a provision log said nothing about which
+// plugin binary was actually loaded, and the aws plugin pin bumps had no
+// log-level verification. Live-caught 2026-11-23 on the forge#1975 pin
+// bump: the `vaws-0.0.1` pre-engine load line could not confirm which
+// aws plugin was running. The Go linker silently ignores a `-X` whose
+// symbol doesn't exist, so the ldflag was landing on nothing. See
+// sc-component-backup#38 for the fleet-wide context.
+var version = "dev"
+
 // SetBroker implements scPlugin.BrokerAware. hashicorp/go-plugin hands
 // the broker to the plugin at GRPCServer time; scPlugin.scCloudPlugin
 // forwards it here so handlers can later call NewPeerClient.
@@ -96,7 +110,7 @@ func (p *awsPlugin) SetBroker(b *hplugin.GRPCBroker) {
 
 func (p *awsPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
 	return &scpluginv1.SchemaResponse{
-		PluginVersion: "aws-0.0.1",
+		PluginVersion: "aws-" + version,
 		ProviderTypes: []string{awsApi.ProviderType},
 		ResourceTypes: []string{
 			awsApi.ResourceTypeS3Bucket,
